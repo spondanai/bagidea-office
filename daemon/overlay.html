@@ -113,6 +113,8 @@
   .seat .nm { font-size: 10px; color: var(--dim); max-width: 52px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .seat.active .nm { color: var(--accent); }
+  .seat .mdl { font-size: 8.5px; color: #6f86d6; max-width: 56px; margin-top: 1px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .85; }
   .seat .dot {
     position: absolute; top: 3px; right: 5px; width: 8px; height: 8px;
     border-radius: 50%; background: #4ade80; outline: 2px solid #0a0f1a;
@@ -1045,6 +1047,14 @@
   function nameOf(id) {
     return (ROSTER[id] && ROSTER[id].name) || id[0].toUpperCase() + id.slice(1);
   }
+  // The model an agent thinks with — shown on its card. CEO is the user (none).
+  function modelOf(id) {
+    if (id === "ceo") return "";
+    const r = ROSTER[id] || {};
+    if (r.model) return r.model;
+    const be = r.backend || "claude";
+    return { claude: "", gemini: "Gemini", openai: "Codex" }[be] || be;
+  }
   // CSS sprite crops from the 256x512 sheet (cell 64): face (14,14,36,36)
   // keeps the face centered with chin + shoulders; standing body (16,6,32,54).
   function face(el, id, size) {
@@ -1106,6 +1116,12 @@
       dot.className = "dot";
       dot.style.background = DOTS[agents[id].state] || "#4ade80";
       seat.append(f, nm, dot);
+      const mdl = modelOf(id);
+      if (mdl) {
+        const md = document.createElement("div");
+        md.className = "mdl"; md.textContent = mdl;
+        seat.appendChild(md);
+      }
       if (id === "ceo" || id === "main") {
         const cr = document.createElement("div");
         cr.className = "crown"; cr.textContent = id === "ceo" ? "👑" : "⭐";
@@ -1137,7 +1153,8 @@
     groupView = null;  // leaving a meeting log view
     target = id;
     document.getElementById("compName").textContent = nameOf(id);
-    document.getElementById("compRole").textContent = roleOf(id);
+    { const md = modelOf(id);
+      document.getElementById("compRole").textContent = roleOf(id) + (md ? " · " + md : ""); }
     body(document.getElementById("compBody"), id);
     document.getElementById("inp").placeholder = id === "ceo"
       ? `สั่งงานในนาม CEO… (Director จะมารับคำสั่ง)`
@@ -1749,6 +1766,18 @@
     usageByAgent[ev.agent] = u;
     usageByAgent.__last = u;
     renderGauge();
+  }
+
+  // Concrete model choices per backend — no "default": every agent picks one.
+  const MODEL_CHOICES = {
+    claude: ["opus", "sonnet", "haiku"],
+    gemini: ["gemini-3-pro-preview", "gemini-2.5-pro", "gemini-2.5-flash"],
+    openai: ["gpt-5.5", "gpt-5", "gpt-5-mini"],
+  };
+  function fillModelSelect(sel, backend, current) {
+    const opts = MODEL_CHOICES[backend] || MODEL_CHOICES.claude;
+    sel.innerHTML = opts.map((m) => `<option value="${m}">${m}</option>`).join("");
+    sel.value = (current && opts.includes(current)) ? current : opts[0];
   }
 
   // ---- 💡 best-value model recommendation per role/tier/backend -----------
@@ -2426,13 +2455,8 @@
          <option value="gemini">Gemini CLI</option>
          <option value="openai">OpenAI / Codex CLI</option>
        </select></div>
-       <div class="field"><label>🎚 MODEL (ว่าง = ค่าเริ่มต้นของ CLI นั้น)</label>
-         <input id="eModel" maxlength="60" list="modelSuggest"
-           placeholder='claude: opus / sonnet / haiku · gemini: gemini-3-pro-preview · openai: gpt-5.5'>
-         <datalist id="modelSuggest">
-           <option value="opus"></option><option value="sonnet"></option><option value="haiku"></option>
-           <option value="gemini-3-pro-preview"></option><option value="gpt-5.5"></option>
-         </datalist>
+       <div class="field"><label>🎚 MODEL — เลือกโมเดลที่ใช้ (ต้องเลือก)</label>
+         <select id="eModel"></select>
          <div id="eModelRec" class="hint" style="margin-top:5px;font-size:11px"></div></div>
        <div class="field"><label>✨ PERSONA COPILOT — บอกสั้นๆ ว่าอยากได้ agent แบบไหน (เติมให้ทุกช่อง)</label>
          <div class="assistrow">
@@ -2616,23 +2640,33 @@
       };
     }
     modalCard.querySelector("#eName").value = a.name;
-    { const be = modalCard.querySelector("#eBackend"); if (be) be.value = a.backend || "claude"; }
-    { const mo = modalCard.querySelector("#eModel"); if (mo) mo.value = a.model || ""; }
-    // 💡 live model recommendation as role / tier / backend change
-    if (modalCard.querySelector("#eModelRec")) {
+    const _beSel = modalCard.querySelector("#eBackend");
+    const _moSel = modalCard.querySelector("#eModel");
+    if (_beSel) _beSel.value = a.backend || "claude";
+    // Force a concrete model choice (no "default"): fill the dropdown for the
+    // backend, keeping the agent's current model or falling back to the
+    // recommended one for the role.
+    if (_moSel) {
+      const _role = () => (modalCard.querySelector("#eRole") || {}).value || "";
+      const _tier = () => (modalCard.querySelector("#eTier") || {}).value || 3;
+      const pickModel = (backend, keep) => {
+        const rec = recommendModel(_role(), _tier(), backend).model;
+        const cur = (keep && (MODEL_CHOICES[backend] || []).includes(keep)) ? keep : rec;
+        fillModelSelect(_moSel, backend, cur);
+      };
+      pickModel(a.backend || "claude", a.model);
+      const recEl = modalCard.querySelector("#eModelRec");
       const updRec = () => {
-        const recEl = modalCard.querySelector("#eModelRec");
         if (!recEl) return;
-        const role = (modalCard.querySelector("#eRole") || {}).value || "";
-        const tier = (modalCard.querySelector("#eTier") || {}).value || 3;
-        const backend = (modalCard.querySelector("#eBackend") || {}).value || "claude";
-        const rec = recommendModel(role, tier, backend);
+        const backend = (_beSel || {}).value || "claude";
+        const rec = recommendModel(_role(), _tier(), backend);
         const tl = { premium: "💎 พรีเมียม", balanced: "⚖️ คุ้มค่า", economy: "🪙 ประหยัด" }[rec.want];
         recEl.innerHTML = `💡 แนะนำ: <b>${rec.model}</b> <span style="opacity:.7">(${tl} — ${rec.reason})</span> · <a href="#" id="eRecApply" style="color:var(--accent)">ใช้เลย</a>`;
         const ap = recEl.querySelector("#eRecApply");
-        if (ap) ap.onclick = (e) => { e.preventDefault(); const mo = modalCard.querySelector("#eModel"); if (mo) mo.value = rec.model; };
+        if (ap) ap.onclick = (e) => { e.preventDefault(); _moSel.value = rec.model; };
       };
-      ["#eRole", "#eTier", "#eBackend"].forEach((s) => {
+      if (_beSel) _beSel.addEventListener("change", () => { pickModel(_beSel.value, null); updRec(); });
+      ["#eRole", "#eTier"].forEach((s) => {
         const el = modalCard.querySelector(s);
         if (el) el.addEventListener("change", updRec);
       });

@@ -951,6 +951,33 @@ function runAgent(agent, prompt, opts = {}) {
   return runClaude(agent, prompt, opts);
 }
 
+// ---- Model economics: context-window limits + price tiers. Powers the
+// realtime token gauge and the per-role "best value" recommendation. Numbers
+// are approximate (providers change them); matched by longest name substring.
+const MODEL_INFO = {
+  opus:               { limit: 200000,  tier: "premium",  inUSD: 15,   outUSD: 75 },
+  sonnet:             { limit: 200000,  tier: "balanced", inUSD: 3,    outUSD: 15 },
+  haiku:              { limit: 200000,  tier: "economy",  inUSD: 1,    outUSD: 5 },
+  "gemini-3-pro":     { limit: 1000000, tier: "balanced", inUSD: 1.25, outUSD: 10 },
+  "gemini-2.5-pro":   { limit: 1000000, tier: "balanced", inUSD: 1.25, outUSD: 10 },
+  "gemini-2.5-flash": { limit: 1000000, tier: "economy",  inUSD: 0.3,  outUSD: 2.5 },
+  "gemini-flash":     { limit: 1000000, tier: "economy",  inUSD: 0.3,  outUSD: 2.5 },
+  gemini:             { limit: 1000000, tier: "balanced", inUSD: 1.25, outUSD: 10 },
+  "gpt-5.5":          { limit: 400000,  tier: "premium",  inUSD: 10,   outUSD: 30 },
+  "gpt-5-mini":       { limit: 400000,  tier: "economy",  inUSD: 0.25, outUSD: 2 },
+  "gpt-5":            { limit: 400000,  tier: "balanced", inUSD: 2.5,  outUSD: 10 },
+  gpt:                { limit: 400000,  tier: "balanced", inUSD: 2.5,  outUSD: 10 },
+};
+const DEFAULT_LIMIT = { claude: 200000, gemini: 1000000, openai: 400000 };
+function modelInfo(model, backend) {
+  const m = String(model || "").toLowerCase();
+  let best = null, len = -1;
+  for (const k of Object.keys(MODEL_INFO))
+    if (m.includes(k) && k.length > len) { best = MODEL_INFO[k]; len = k.length; }
+  if (best) return best;
+  return { limit: (DEFAULT_LIMIT[backend] || 200000), tier: "balanced", inUSD: 0, outUSD: 0 };
+}
+
 function runClaude(agent, prompt, opts = {}) {
   const task = "t" + ++taskCounter;
 
@@ -1181,6 +1208,21 @@ SPEAK: <ประโยคพูดสั้นๆ 1 ประโยค เป�
           entry.ts = Date.now();
           saveSess();
         }
+        // Real token usage → realtime gauge. Context = prompt-side tokens
+        // (fresh + cached); out = generated tokens.
+        {
+          const u = m.usage || {};
+          const ctx = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) +
+            (u.cache_read_input_tokens || 0);
+          const outTok = u.output_tokens || 0;
+          const mdl = agentModel(a) || "default";
+          const info = modelInfo(agentModel(a), "claude");
+          entry.usage = { ctx, out: outTok, total: ctx + outTok,
+            cost: Number(m.total_cost_usd) || 0, model: mdl, limit: info.limit };
+          broadcast({ type: "task.usage", agent, task, session: entry.key,
+            model: mdl, ctx, out: outTok, total: ctx + outTok,
+            limit: info.limit, cost: Number(m.total_cost_usd) || 0, est: false });
+        }
         broadcast({ type: m.is_error ? "task.failed" : "task.completed",
           agent, task, session: entry.key });
         statBump(m.is_error ? "failed" : "done", null, Number(m.total_cost_usd) || 0);
@@ -1298,6 +1340,17 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
       while (entry.log.length > 200) entry.log.shift();
       saveSess();
       broadcast({ type: "chat.message", agent, task, text: shown, session: entry.key });
+    }
+    // No token stream from generic CLIs — estimate from characters (~4/token).
+    {
+      const info = modelInfo(model, a.backend);
+      const ctxEst = Math.round(fullPrompt.length / 4);
+      const outEst = Math.round(text.length / 4);
+      entry.usage = { ctx: ctxEst, out: outEst, total: ctxEst + outEst, cost: 0,
+        model: model || a.backend, limit: info.limit, est: true };
+      broadcast({ type: "task.usage", agent, task, session: entry.key,
+        model: model || a.backend, ctx: ctxEst, out: outEst, total: ctxEst + outEst,
+        limit: info.limit, cost: 0, est: true });
     }
     broadcast({ type: ok ? "task.completed" : "task.failed", agent, task, session: entry.key });
     statBump(ok ? "done" : "failed", null, 0);
@@ -3158,6 +3211,11 @@ const server = http.createServer((req, res) => {
         });
       } catch (e) { res.writeHead(400); res.end(String(e.message)); }
     });
+
+  } else if (req.method === "GET" && req.url === "/models") {
+    // Model economics for the UI: gauge limits + price tiers.
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ info: MODEL_INFO, defaultLimit: DEFAULT_LIMIT }));
 
   } else if (req.method === "GET" && req.url === "/stats") {
     // 📊 dashboard: last 7 days of run stats + live system facts.

@@ -554,6 +554,21 @@
     background: rgba(10, 14, 24, 0.5); border-top: 1px solid rgba(255,255,255,0.05);
   }
   #threadBar b { color: var(--accent); font-weight: 600; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 🎚 realtime token gauge — context-window usage of the active agent */
+  #tokGauge { display: none; flex: none; margin: 4px 14px 0; padding: 6px 9px;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: rgba(255,255,255,0.03); font-size: 11px; }
+  #tokGauge[data-on="1"] { display: block; }
+  .tgTop { display: flex; justify-content: space-between; align-items: center;
+    color: var(--dim); margin-bottom: 4px; }
+  #tgLabel { font-weight: 600; color: var(--text); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 62%; }
+  #tgPct { font-weight: 700; }
+  .tgBar { height: 7px; border-radius: 5px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  #tgFill { height: 100%; width: 0; border-radius: 5px;
+    transition: width 0.4s ease, background 0.4s ease; }
+  .tgFoot { display: flex; justify-content: space-between; color: var(--dim);
+    margin-top: 3px; font-size: 10px; }
 
   /* ---------- settings / editor / ID-card modal ---------- */
   #modal {
@@ -772,6 +787,11 @@
   <span class="hint" id="pttHint"></span></div>
 
 <div id="threadBar">🧵 thread: <b id="threadName">ล่าสุด (ต่อเนื่องอัตโนมัติ)</b></div>
+<div id="tokGauge" data-on="0">
+  <div class="tgTop"><span id="tgLabel">🎚 tokens</span><span id="tgPct"></span></div>
+  <div class="tgBar"><div id="tgFill"></div></div>
+  <div class="tgFoot"><span id="tgNum"></span><span id="tgCost"></span></div>
+</div>
 <div id="attachRow"></div>
 <footer>
   <input id="inp" placeholder="Message Main… (Enter to send)" autofocus
@@ -1126,6 +1146,7 @@
     // The realtime call always reaches the main agent — offer it from the CEO seat too.
     document.getElementById("liveBtn").style.display = (id === "main" || id === "ceo") ? "" : "none";
     renderRail();
+    if (typeof renderGauge === "function") renderGauge();  // 🎚 show this agent's token gauge
     refreshThreadBar(true);  // clicking a seat always shows that agent's latest thread
   }
 
@@ -1694,6 +1715,57 @@
       box.appendChild(list);
     }
   }
+  // ---- 🎚 realtime token gauge — context-window usage per agent ----------
+  const usageByAgent = {};   // agent -> { ctx,out,limit,cost,model,est }
+  function fmtTok(n) {
+    n = Number(n) || 0;
+    return n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : String(n);
+  }
+  function renderGauge() {
+    const g = document.getElementById("tokGauge");
+    if (!g) return;
+    const u = usageByAgent[target] || usageByAgent.__last;
+    if (!u) { g.dataset.on = "0"; return; }
+    g.dataset.on = "1";
+    const limit = u.limit || 200000;
+    const pct = Math.min(100, Math.round((u.ctx / limit) * 100));
+    const fill = document.getElementById("tgFill");
+    fill.style.width = pct + "%";
+    fill.style.background = pct < 60
+      ? "linear-gradient(90deg,#3fb950,#2ea043)"
+      : pct < 85 ? "linear-gradient(90deg,#d29922,#bb8009)"
+                 : "linear-gradient(90deg,#f85149,#da3633)";
+    document.getElementById("tgLabel").textContent =
+      "🎚 " + (u.model || "—") + (u.est ? " (≈ประเมิน)" : "");
+    document.getElementById("tgPct").textContent = pct + "% context";
+    document.getElementById("tgNum").textContent =
+      fmtTok(u.ctx) + " / " + fmtTok(limit) + " tok · out " + fmtTok(u.out);
+    document.getElementById("tgCost").textContent =
+      u.cost ? "$" + Number(u.cost).toFixed(3) : (u.est ? "~ฟรี/ประเมิน" : "");
+  }
+  function updateGauge(ev) {
+    const u = { ctx: ev.ctx || 0, out: ev.out || 0, limit: ev.limit || 200000,
+      cost: ev.cost || 0, model: ev.model || "", est: !!ev.est };
+    usageByAgent[ev.agent] = u;
+    usageByAgent.__last = u;
+    renderGauge();
+  }
+
+  // ---- 💡 best-value model recommendation per role/tier/backend -----------
+  function recommendModel(role, tier, backend) {
+    const r = String(role || "").toLowerCase();
+    const simple = /qa|test|format|summar|proof|review|note|translat|tag|label|sort|intern|assistant|support|ผู้ช่วย|สรุป|ตรวจ|แปล|จัดรูป|ทดสอบ/.test(r);
+    const complex = /architect|lead|director|strateg|research|analy|design|secur|senior|principal|engineer|หัวหน้า|สถาปัตย|วิจัย|วิเคราะห์|ออกแบบ|กลยุทธ|วิศวกร/.test(r);
+    const want = (Number(tier) <= 2 || complex) ? "premium" : simple ? "economy" : "balanced";
+    const map = {
+      claude: { premium: ["opus", "งานซับซ้อน/ตัดสินใจ"], balanced: ["sonnet", "คุ้มสุดสำหรับงานทั่วไป"], economy: ["haiku", "งานเบา ถูกสุด"] },
+      gemini: { premium: ["gemini-3-pro-preview", "เหตุผลแน่น context ใหญ่"], balanced: ["gemini-3-pro-preview", "สมดุล"], economy: ["gemini-2.5-flash", "เร็ว/ถูก"] },
+      openai: { premium: ["gpt-5.5", "งานยาก"], balanced: ["gpt-5", "ทั่วไป"], economy: ["gpt-5-mini", "ถูกสุด"] },
+    };
+    const [model, reason] = (map[backend] || map.claude)[want];
+    return { want, model, reason };
+  }
+
   // One mirror for everything worth glancing at while streaming/debugging.
   function feedRoute(ev) {
     if (ev.replay || ev.theater) return;
@@ -2360,7 +2432,8 @@
          <datalist id="modelSuggest">
            <option value="opus"></option><option value="sonnet"></option><option value="haiku"></option>
            <option value="gemini-3-pro-preview"></option><option value="gpt-5.5"></option>
-         </datalist></div>
+         </datalist>
+         <div id="eModelRec" class="hint" style="margin-top:5px;font-size:11px"></div></div>
        <div class="field"><label>✨ PERSONA COPILOT — บอกสั้นๆ ว่าอยากได้ agent แบบไหน (เติมให้ทุกช่อง)</label>
          <div class="assistrow">
            <input id="eBrief" placeholder='เช่น "นักออกแบบ UI เน้น minimal พูดติดตลก" แล้วกด ✨'>
@@ -2545,6 +2618,26 @@
     modalCard.querySelector("#eName").value = a.name;
     { const be = modalCard.querySelector("#eBackend"); if (be) be.value = a.backend || "claude"; }
     { const mo = modalCard.querySelector("#eModel"); if (mo) mo.value = a.model || ""; }
+    // 💡 live model recommendation as role / tier / backend change
+    if (modalCard.querySelector("#eModelRec")) {
+      const updRec = () => {
+        const recEl = modalCard.querySelector("#eModelRec");
+        if (!recEl) return;
+        const role = (modalCard.querySelector("#eRole") || {}).value || "";
+        const tier = (modalCard.querySelector("#eTier") || {}).value || 3;
+        const backend = (modalCard.querySelector("#eBackend") || {}).value || "claude";
+        const rec = recommendModel(role, tier, backend);
+        const tl = { premium: "💎 พรีเมียม", balanced: "⚖️ คุ้มค่า", economy: "🪙 ประหยัด" }[rec.want];
+        recEl.innerHTML = `💡 แนะนำ: <b>${rec.model}</b> <span style="opacity:.7">(${tl} — ${rec.reason})</span> · <a href="#" id="eRecApply" style="color:var(--accent)">ใช้เลย</a>`;
+        const ap = recEl.querySelector("#eRecApply");
+        if (ap) ap.onclick = (e) => { e.preventDefault(); const mo = modalCard.querySelector("#eModel"); if (mo) mo.value = rec.model; };
+      };
+      ["#eRole", "#eTier", "#eBackend"].forEach((s) => {
+        const el = modalCard.querySelector(s);
+        if (el) el.addEventListener("change", updRec);
+      });
+      updRec();
+    }
     modalCard.querySelector("#eCancel").onclick = () => openSettings("agents");
     modalCard.querySelector("#eSave").onclick = async () => {
       const name = modalCard.querySelector("#eName").value.trim();
@@ -3819,6 +3912,7 @@
     // journals so they can never animate anything.
     if (ev.theater || String(ev.type).startsWith("theater.")) return;
     trackRunning(ev);  // 🔵 the NOW-WORKING strips (replays rebuild state)
+    if (ev.type === "task.usage") updateGauge(ev);  // 🎚 realtime token gauge
     feedRoute(ev);  // the 📡 feed mirrors everything glanceable
 
     // Ghost traffic peels off before anything can mint a rail seat for it.

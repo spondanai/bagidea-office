@@ -23,17 +23,9 @@ var _wb_lines: Array[String] = []
 # anchor (rooms can be swapped/moved in the editor), not a hard-coded spot.
 var _wb_world_pos: Vector3 = Vector3(13, 2.4, -0.5)
 
-# 📊 Per-provider token-budget gauges, pinned top-left — glanceable on the
-# wallpaper with no menu. Fed by the daemon's usage.overview events.
-var _bud_panel: PanelContainer
-var _bud_box: VBoxContainer
-var _bud_rows := {}   # provider id -> {block, name_label, reset_label, bar, fill}
-const PROV_NAME := {"claude": "Claude", "gemini": "Gemini", "openai": "Codex"}
-
 func _ready() -> void:
 	layer = 2
 	_build_whiteboard()
-	_build_budgets()
 
 # ---------------------------------------------------------------- nameplates
 
@@ -375,111 +367,3 @@ func _process(_delta: float) -> void:
 	if _wb_panel.visible:
 		var sp2 := cam.unproject_position(_wb_world_pos)
 		_wb_panel.position = sp2 - Vector2(_wb_panel.size.x * 0.5, _wb_panel.size.y)
-
-# ---------------------------------------------------------------- 📊 budgets
-func _build_budgets() -> void:
-	var style := StyleBoxFlat.new()
-	style.bg_color = Color(0.05, 0.07, 0.12, 0.82)
-	style.set_corner_radius_all(11)
-	style.set_border_width_all(1)
-	style.border_color = Color(0.4, 0.78, 1.0, 0.5)
-	style.set_content_margin_all(11)
-	_bud_panel = PanelContainer.new()
-	_bud_panel.add_theme_stylebox_override("panel", style)
-	_bud_panel.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_bud_panel.position = Vector2(18, 18)
-	_bud_panel.visible = false
-	_bud_box = VBoxContainer.new()
-	_bud_box.add_theme_constant_override("separation", 7)
-	_bud_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var hdr := Label.new()
-	hdr.text = "📊 TOKEN BUDGET"
-	hdr.add_theme_font_size_override("font_size", 11)
-	hdr.add_theme_color_override("font_color", Color(0.7, 0.82, 0.95))
-	hdr.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_bud_box.add_child(hdr)
-	_bud_panel.add_child(_bud_box)
-	add_child(_bud_panel)
-
-func _make_bud_row(_id: String) -> Dictionary:
-	var block := VBoxContainer.new()
-	block.add_theme_constant_override("separation", 2)
-	block.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var top := HBoxContainer.new()
-	top.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var nm := Label.new()
-	nm.add_theme_font_size_override("font_size", 12)
-	nm.add_theme_color_override("font_color", Color.WHITE)
-	nm.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	nm.custom_minimum_size = Vector2(120, 0)
-	var rs := Label.new()
-	rs.add_theme_font_size_override("font_size", 10)
-	rs.add_theme_color_override("font_color", Color(0.62, 0.68, 0.8))
-	rs.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	rs.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	rs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	top.add_child(nm)
-	top.add_child(rs)
-	block.add_child(top)
-	var bar := ProgressBar.new()
-	bar.min_value = 0
-	bar.max_value = 100
-	bar.show_percentage = false
-	bar.custom_minimum_size = Vector2(228, 7)
-	bar.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	var track := StyleBoxFlat.new()
-	track.bg_color = Color(1, 1, 1, 0.09)
-	track.set_corner_radius_all(4)
-	bar.add_theme_stylebox_override("background", track)
-	var fill := StyleBoxFlat.new()
-	fill.set_corner_radius_all(4)
-	bar.add_theme_stylebox_override("fill", fill)
-	block.add_child(bar)
-	_bud_box.add_child(block)
-	return {"block": block, "name_label": nm, "reset_label": rs, "bar": bar, "fill": fill}
-
-func _bud_color(pct: int) -> Color:
-	if pct < 60:
-		return Color(0.25, 0.72, 0.31)
-	if pct < 85:
-		return Color(0.82, 0.6, 0.13)
-	return Color(0.97, 0.32, 0.29)
-
-func _fmt_reset(ms: float) -> String:
-	var s := int(ms / 1000.0)
-	var h := s / 3600
-	var m := (s % 3600) / 60
-	return ("%dh %02dm" % [h, m]) if h > 0 else ("%dm" % m)
-
-func _fmt_tok(n: float) -> String:
-	if n >= 1000000.0:
-		return "%.1fM" % (n / 1000000.0)
-	if n >= 1000.0:
-		return "%.0fk" % (n / 1000.0)
-	return str(int(n))
-
-func update_budgets(providers: Array) -> void:
-	if _bud_panel == null:
-		_build_budgets()
-	_bud_panel.visible = providers.size() > 0
-	var seen := {}
-	for p in providers:
-		var id := str(p.get("provider", ""))
-		seen[id] = true
-		var pct := int(p.get("pct", 0))
-		if not _bud_rows.has(id):
-			_bud_rows[id] = _make_bud_row(id)
-		var row: Dictionary = _bud_rows[id]
-		var nm: String = PROV_NAME.get(id, id.capitalize())
-		row.name_label.text = "%s  %d%%" % [nm, pct]
-		row.reset_label.text = "⟳ %s · %s/%s" % [
-			_fmt_reset(float(p.get("resetInMs", 0))),
-			_fmt_tok(float(p.get("used", 0))),
-			_fmt_tok(float(p.get("budget", 1)))]
-		row.bar.value = pct
-		row.fill.bg_color = _bud_color(pct)
-		row.bar.add_theme_stylebox_override("fill", row.fill)
-	for id in _bud_rows.keys():
-		if not seen.has(id):
-			_bud_rows[id].block.queue_free()
-			_bud_rows.erase(id)

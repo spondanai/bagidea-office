@@ -31,11 +31,13 @@ const MINI: (f64, f64) = (390.0, 430.0);
 const FEED_W: f64 = 330.0;
 const PARK: (f64, f64) = (-9000.0, 100.0);
 const SPLASH_SIZE: f64 = 210.0;
+const BUDGET: (f64, f64) = (252.0, 150.0); // floating token-budget panel
 
 #[derive(Debug)]
 enum UserEvent {
     Toggle,
     DragOrb,
+    DragBudget,
     DragOverlay,
     HideOverlay,
     MiniToggle,
@@ -132,6 +134,41 @@ const ORB_HTML: &str = r#"<!doctype html>
     e.preventDefault();
     window.ipc.postMessage('mode');
   });
+</script>
+</body></html>"#;
+
+// Floating, draggable token-budget panel — sits ABOVE the desktop icons (like
+// the chat orb), not inside the wallpaper. Reads the daemon's usage.overview
+// stream and shows each provider's window usage + reset countdown.
+const BUDGET_HTML: &str = r#"<!doctype html>
+<html><body style="margin:0;overflow:hidden;background:#0c1322;color:#e8eef7;font:11px -apple-system,BlinkMacSystemFont,system-ui,sans-serif;user-select:none;-webkit-user-select:none;cursor:move;padding:9px 11px;box-sizing:border-box">
+<div style="font-size:10px;color:#9fb2cc;margin-bottom:7px;letter-spacing:.5px">📊 TOKEN BUDGET</div>
+<div id="rows"><div style="color:#6b7a93;font-size:10px">— ยังไม่มีการใช้งาน —</div></div>
+<style>
+  .row{margin-bottom:7px}
+  .rtop{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;margin-bottom:2px}
+  .rname{font-weight:600}.rreset{color:#8a99b3;font-size:9.5px;white-space:nowrap}
+  .bar{height:6px;border-radius:4px;background:rgba(255,255,255,.09);overflow:hidden}
+  .fill{height:100%;border-radius:4px;transition:width .4s,background .4s}
+</style>
+<script>
+  const NAME={claude:"Claude",gemini:"Gemini",openai:"Codex"};
+  const fmtTok=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?Math.round(n/1e3)+"k":(n||0)+"";
+  const fmtReset=ms=>{let s=Math.floor((ms||0)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h>0?h+"h "+String(m).padStart(2,"0")+"m":m+"m"};
+  const color=p=>p<60?"linear-gradient(90deg,#3fb950,#2ea043)":p<85?"linear-gradient(90deg,#d29922,#bb8009)":"linear-gradient(90deg,#f85149,#da3633)";
+  function render(ps){
+    const el=document.getElementById("rows");
+    if(!ps||!ps.length){el.innerHTML='<div style="color:#6b7a93;font-size:10px">— ยังไม่มีการใช้งาน —</div>';return}
+    el.innerHTML=ps.map(p=>{const pct=p.pct||0;return `<div class="row"><div class="rtop"><span class="rname">${NAME[p.provider]||p.provider} ${pct}%</span><span class="rreset">⟳ ${fmtReset(p.resetInMs)} · ${fmtTok(p.used)}/${fmtTok(p.budget)}</span></div><div class="bar"><div class="fill" style="width:${pct}%;background:${color(pct)}"></div></div></div>`}).join("")
+  }
+  fetch("http://127.0.0.1:8787/usage").then(r=>r.json()).then(d=>render(d.providers)).catch(()=>{});
+  function wire(){try{const ws=new WebSocket('ws://127.0.0.1:8787/ws');ws.onmessage=m=>{try{const e=JSON.parse(m.data);if(e.type==='usage.overview')render(e.providers)}catch{}};ws.onclose=()=>setTimeout(wire,4000)}catch{setTimeout(wire,4000)}}
+  wire();
+  // Drag the panel anywhere — same feel as the chat head.
+  let down=null,moved=false;
+  document.body.addEventListener('mousedown',e=>{if(e.button===0){down=[e.screenX,e.screenY];moved=false}});
+  document.body.addEventListener('mousemove',e=>{if(down&&!moved&&Math.hypot(e.screenX-down[0],e.screenY-down[1])>6){moved=true;window.ipc.postMessage('drag-budget')}});
+  document.body.addEventListener('mouseup',()=>{down=null});
 </script>
 </body></html>"#;
 
@@ -1001,6 +1038,24 @@ fn main() {
     platform::region_circle(&orb, ORB_SIZE);
     orb.set_outer_position(LogicalPosition::new(PARK.0, PARK.1 + 200.0));
 
+    // ---- 📊 floating token-budget panel (above the icons, draggable)
+    let budget = chrome_window(
+        &event_loop, "BagIdea Budget", BUDGET.0, BUDGET.1, 22.0, 22.0, None,
+    );
+    platform::set_no_activate(&budget);
+    let budget_id = budget.id();
+    let p_budget = proxy.clone();
+    let _budget_view = WebViewBuilder::new()
+        .with_html(BUDGET_HTML)
+        .with_ipc_handler(move |req| {
+            if req.body().as_str() == "drag-budget" {
+                let _ = p_budget.send_event(UserEvent::DragBudget);
+            }
+        })
+        .build(&budget)
+        .expect("budget webview");
+    platform::region_round(&budget, BUDGET.0, BUDGET.1, 14.0);
+
     let raise_orb = |orb: &Window| {
         orb.set_always_on_top(false);
         orb.set_always_on_top(true);
@@ -1104,6 +1159,8 @@ fn main() {
                     platform::region_round(&overlay, w, h, if feed { 14.0 } else { 18.0 });
                 } else if window_id == splash_id {
                     platform::region_circle(&splash, SPLASH_SIZE);
+                } else if window_id == budget_id {
+                    platform::region_round(&budget, BUDGET.0, BUDGET.1, 14.0);
                 }
             }
             Event::UserEvent(ue) => match ue {
@@ -1112,6 +1169,7 @@ fn main() {
                     splash.set_visible(false);
                     orb.set_outer_position(LogicalPosition::new(orb_x, orb_y));
                     raise_orb(&orb);
+                    raise_orb(&budget);
                 }
                 UserEvent::EditorOpening => {
                     if platform::focus_pid(editor_pid) {
@@ -1160,6 +1218,7 @@ fn main() {
                     raise_orb(&orb);
                 }
                 UserEvent::DragOrb => { let _ = orb.drag_window(); }
+                UserEvent::DragBudget => { let _ = budget.drag_window(); }
                 UserEvent::DragOverlay => { let _ = overlay.drag_window(); }
                 UserEvent::PttKey(pressed) => {
                     if pressed && last_ptt.elapsed().as_millis() >= 600 {

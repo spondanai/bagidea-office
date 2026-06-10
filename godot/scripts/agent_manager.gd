@@ -432,9 +432,13 @@ func _apply_roster(evt: Dictionary) -> void:
 		a.node.apply_identity(roster[id].name, roster[id].role, roster[id].avatar)
 		a.node.set_aura(roster[id].aura)
 		a.node.set_state(a.state)
-	# Registry agents deleted while this renderer was away.
+	# Anyone the registry roster no longer lists shouldn't be on the floor —
+	# including agents a journal replay resurrected after they were deleted.
+	# (Ghost clones carry "#" and are managed separately.)
 	for id in agents.keys().duplicate():
-		if agents[id].get("registered", false) and not roster.has(id):
+		if id == "ceo" or id.contains("#"):
+			continue
+		if not roster.has(id):
 			_remove_agent(id)
 
 func _remove_agent(id: String) -> void:

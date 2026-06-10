@@ -457,6 +457,20 @@ function journalTail(n) {
   }
 }
 
+// Drop every journaled event tied to an agent — called on delete so a later
+// replay can't bring its character back to life in the world/overlay.
+function pruneJournalAgent(id) {
+  try {
+    if (!fs.existsSync(JOURNAL)) return;
+    const kept = fs.readFileSync(JOURNAL, "utf8").split("\n").filter((line) => {
+      if (!line.trim()) return false;
+      try { const e = JSON.parse(line); return e.agent !== id && e.target !== id && e.sub !== id; }
+      catch { return false; }
+    });
+    fs.writeFileSync(JOURNAL, kept.length ? kept.join("\n") + "\n" : "");
+  } catch {}
+}
+
 // ---------------------------------------------------------------- bus
 
 function broadcast(evt, journal = true) {
@@ -2731,6 +2745,7 @@ const server = http.createServer((req, res) => {
         if (a.protected) { res.writeHead(403); return res.end("protected agent"); }
         delete reg.agents[id];
         saveReg();
+        pruneJournalAgent(id);   // so a replay can't resurrect the character
         broadcast({ type: "roster.removed", agent: id }, false);
         pushRoster();
         res.writeHead(200);

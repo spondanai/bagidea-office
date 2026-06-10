@@ -3821,6 +3821,14 @@
       } catch {}
       gateVoiceUI();
       for (const id of Object.keys(ROSTER)) ensureAgent(id);
+      // Drop anyone the registry no longer lists (e.g. an agent a journal
+      // replay resurrected after it was deleted). Ghosts (#) stay.
+      for (const id of Object.keys(agents)) {
+        if (id !== "ceo" && !id.includes("#") && !ROSTER[id]) {
+          delete agents[id];
+          if (target === id) setTarget("main");
+        }
+      }
       renderRail();
       setTarget(target);   // refresh name/role if the target was edited
       return;

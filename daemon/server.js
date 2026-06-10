@@ -1042,6 +1042,60 @@ function pollClaudeUsage() {
   });
 }
 
+// REAL quota for ALL providers via onWatch (github.com/onllm-dev/onwatch): it
+// polls the provider APIs directly (claude keychain, codex auth, gemini oauth)
+// — the only way to get gemini /model + codex /status quota, which the CLIs
+// don't expose headlessly. We read its local SQLite DB (no API auth needed).
+const ONWATCH_DB = path.join(require("os").homedir(), ".onwatch", "data", "onwatch.db");
+let onwatchState = {};   // provider -> { pct, resetMs, model?, ts }
+function sqliteJson(query, cb) {
+  if (!fs.existsSync(ONWATCH_DB)) return cb(null);
+  require("child_process").execFile("sqlite3", ["-json", ONWATCH_DB, query],
+    { timeout: 5000 }, (err, out) => {
+      if (err || !out) return cb(null);
+      try { cb(JSON.parse(out)); } catch { cb(null); }
+    });
+}
+function geminiOfficeModels() {
+  const set = new Set();
+  for (const a of Object.values(reg.agents))
+    if ((a.backend || "") === "gemini" && a.model) set.add(a.model);
+  return set;
+}
+function pollOnwatch() {
+  if (!fs.existsSync(ONWATCH_DB)) return;
+  const now = Date.now();
+  // Claude: the 5-hour subscription window.
+  sqliteJson("SELECT utilization,resets_at FROM anthropic_quota_values WHERE quota_name='five_hour' ORDER BY id DESC LIMIT 1;", (r) => {
+    if (r && r[0]) onwatchState.claude = { pct: Math.round(r[0].utilization),
+      resetMs: Date.parse(r[0].resets_at) - now, ts: now };
+  });
+  // Codex: latest quota value.
+  sqliteJson("SELECT utilization,resets_at FROM codex_quota_values ORDER BY id DESC LIMIT 1;", (r) => {
+    if (r && r[0]) onwatchState.openai = { pct: Math.round(r[0].utilization),
+      resetMs: Date.parse(r[0].resets_at) - now, ts: now };
+  });
+  // Gemini: per-model buckets — show the office's gemini model (or the most-used).
+  sqliteJson("SELECT raw_json FROM gemini_snapshots ORDER BY id DESC LIMIT 1;", (r) => {
+    if (!r || !r[0]) return;
+    try {
+      const buckets = JSON.parse(r[0].raw_json).buckets || [];
+      const want = geminiOfficeModels();
+      const pool = buckets.filter((b) => want.size === 0 || want.has(b.modelId));
+      const use = (pool.length ? pool : buckets);
+      let pick = null;
+      for (const b of use) {
+        const used = (1 - (b.remainingFraction || 0)) * 100;
+        if (!pick || used > pick.used) pick = { used, resetTime: b.resetTime, modelId: b.modelId };
+      }
+      if (pick) onwatchState.gemini = { pct: Math.round(pick.used),
+        resetMs: Date.parse(pick.resetTime) - now, model: pick.modelId, ts: now };
+    } catch {}
+  });
+  setTimeout(broadcastOverview, 800);
+}
+const onwatchRunning = () => fs.existsSync(ONWATCH_DB);
+
 function providerOverview() {
   const now = Date.now();
   return providersInPlay().map((p) => {
@@ -1050,16 +1104,23 @@ function providerOverview() {
     let used = 0, resetInMs = winMs, cost = 0;
     if (s && now - s.start < winMs) { used = s.tok; cost = s.cost; resetInMs = s.start + winMs - now; }
     let pct = Math.min(100, Math.round((used / cfg.budgetTok) * 100));
-    let resetLabel = "", source = "est";
-    // Live Claude subscription window overrides the estimate.
-    if (p === "claude" && claudeUsageState.sessionPct != null && now - claudeUsageState.ts < 12 * 60000) {
+    let resetLabel = "", source = "est", model = "";
+    const ow = onwatchState[p];
+    if (ow && now - ow.ts < 6 * 60000) {
+      // Real provider quota from onWatch wins for every provider.
+      pct = ow.pct;
+      if (ow.resetMs != null && !isNaN(ow.resetMs)) resetInMs = Math.max(0, ow.resetMs);
+      if (ow.model) model = ow.model;
+      source = "live";
+    } else if (p === "claude" && claudeUsageState.sessionPct != null && now - claudeUsageState.ts < 12 * 60000) {
+      // Fallback: claude -p "/usage" when onWatch isn't running.
       pct = claudeUsageState.sessionPct;
       resetLabel = claudeUsageState.sessionReset;
       const ms = parseResetMs(claudeUsageState.sessionReset);
       if (ms != null) resetInMs = ms;
       source = "live";
     }
-    return { provider: p, used, budget: cfg.budgetTok, pct, resetInMs, resetLabel,
+    return { provider: p, used, budget: cfg.budgetTok, pct, resetInMs, resetLabel, model,
       hours: cfg.hours, cost, source,
       week: p === "claude" ? { pct: claudeUsageState.weekPct, reset: claudeUsageState.weekReset } : undefined };
   });
@@ -1069,9 +1130,14 @@ function broadcastOverview() {
 }
 // Keep the office HUD's reset countdowns honest even when idle.
 setInterval(broadcastOverview, 60000);
-// Poll the real Claude quota now and every 4 minutes (cheap slash command).
-setTimeout(pollClaudeUsage, 3000);
-setInterval(pollClaudeUsage, 240000);
+// Prefer onWatch (real quota, all providers); fall back to claude -p "/usage".
+if (onwatchRunning()) {
+  setTimeout(pollOnwatch, 1500);
+  setInterval(pollOnwatch, 60000);
+} else {
+  setTimeout(pollClaudeUsage, 3000);
+  setInterval(pollClaudeUsage, 240000);
+}
 
 function runClaude(agent, prompt, opts = {}) {
   const task = "t" + ++taskCounter;

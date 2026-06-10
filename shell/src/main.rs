@@ -154,7 +154,7 @@ const BUDGET_HTML: &str = r#"<!doctype html>
 <script>
   const NAME={claude:"Claude",gemini:"Gemini",openai:"Codex"};
   const fmtTok=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?Math.round(n/1e3)+"k":(n||0)+"";
-  const fmtReset=ms=>{let s=Math.floor((ms||0)/1000),h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h>0?h+"h "+String(m).padStart(2,"0")+"m":m+"m"};
+  const fmtReset=ms=>{let s=Math.floor((ms||0)/1000),d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d>0?d+"d "+h+"h":h>0?h+"h "+String(m).padStart(2,"0")+"m":m+"m"};
   const color=p=>p<60?"linear-gradient(90deg,#3fb950,#2ea043)":p<85?"linear-gradient(90deg,#d29922,#bb8009)":"linear-gradient(90deg,#f85149,#da3633)";
   function render(ps){
     const el=document.getElementById("rows");

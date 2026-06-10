@@ -1011,6 +1011,9 @@ function trackProviderUse(provider, tok, cost) {
 function providersInPlay() {
   const set = new Set(Object.keys(providerUse));
   for (const a of Object.values(reg.agents)) set.add(a.backend || "claude");
+  // Always show providers onWatch is actually monitoring (real quota), even
+  // if no office agent uses them yet.
+  if (typeof onwatchState === "object") for (const k of Object.keys(onwatchState)) set.add(k);
   return [...set];
 }
 // REAL Claude quota: `claude -p "/usage"` prints the live subscription window

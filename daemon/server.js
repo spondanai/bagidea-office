@@ -916,8 +916,10 @@ SUB: <งานย่อยที่ชัดเจนครบถ้วนใ�
 // built-ins are merged underneath so the common ones work out of the box.
 const BUILTIN_BACKENDS = {
   claude: { kind: "claude", cmd: "claude" },
-  // `echo <prompt> | gemini -m <model>` → final text on stdout.
-  gemini: { kind: "generic", cmd: "gemini", modelFlag: "-m", promptMode: "stdin" },
+  // `echo <prompt> | gemini -m <model>` → final text on stdout. Gemini blocks
+  // on a trust prompt in headless cwd, so opt the workspace in via env.
+  gemini: { kind: "generic", cmd: "gemini", modelFlag: "-m", promptMode: "stdin",
+    env: { GEMINI_CLI_TRUST_WORKSPACE: "true" } },
   // OpenAI via the Codex CLI: `codex exec -m <model> "<prompt>"`.
   openai: { kind: "generic", cmd: "codex", args: ["exec"], modelFlag: "-m", promptMode: "arg" },
 };
@@ -1264,7 +1266,8 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
   try {
     child = spawn(be.cmd, argv, {
       cwd, shell: false,
-      env: { ...process.env, ...(reg.apiKeys || {}), OFFICE_AGENT: agent, OFFICE_TASK: task },
+      env: { ...process.env, ...(reg.apiKeys || {}), ...(be.env || {}),
+        OFFICE_AGENT: agent, OFFICE_TASK: task },
     });
   } catch (e) {
     broadcast({ type: "task.failed", agent, task, session: entry.key });

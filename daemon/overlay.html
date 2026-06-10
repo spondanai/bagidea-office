@@ -2349,6 +2349,18 @@
          <option value="2">หัวหน้าทีม (Lead)</option>
          <option value="3">ทีมงาน (Staff)</option>
        </select></div>
+       <div class="field"><label>🧠 BACKEND — สมอง CLI ที่ใช้</label><select id="eBackend">
+         <option value="claude">Claude Code (เต็มระบบ — tools + Security Center)</option>
+         <option value="gemini">Gemini CLI</option>
+         <option value="openai">OpenAI / Codex CLI</option>
+       </select></div>
+       <div class="field"><label>🎚 MODEL (ว่าง = ค่าเริ่มต้นของ CLI นั้น)</label>
+         <input id="eModel" maxlength="60" list="modelSuggest"
+           placeholder='claude: opus / sonnet / haiku · gemini: gemini-3-pro-preview · openai: gpt-5.5'>
+         <datalist id="modelSuggest">
+           <option value="opus"></option><option value="sonnet"></option><option value="haiku"></option>
+           <option value="gemini-3-pro-preview"></option><option value="gpt-5.5"></option>
+         </datalist></div>
        <div class="field"><label>✨ PERSONA COPILOT — บอกสั้นๆ ว่าอยากได้ agent แบบไหน (เติมให้ทุกช่อง)</label>
          <div class="assistrow">
            <input id="eBrief" placeholder='เช่น "นักออกแบบ UI เน้น minimal พูดติดตลก" แล้วกด ✨'>
@@ -2531,6 +2543,8 @@
       };
     }
     modalCard.querySelector("#eName").value = a.name;
+    { const be = modalCard.querySelector("#eBackend"); if (be) be.value = a.backend || "claude"; }
+    { const mo = modalCard.querySelector("#eModel"); if (mo) mo.value = a.model || ""; }
     modalCard.querySelector("#eCancel").onclick = () => openSettings("agents");
     modalCard.querySelector("#eSave").onclick = async () => {
       const name = modalCard.querySelector("#eName").value.trim();
@@ -2540,6 +2554,8 @@
         : { id, name, role: roleSel.value, avatar, aura: myAura,
             prompt: modalCard.querySelector("#ePrompt").value,
             tier: Number(modalCard.querySelector("#eTier").value) || 3,
+            backend: (modalCard.querySelector("#eBackend") || {}).value || "claude",
+            model: (modalCard.querySelector("#eModel") || {}).value || "",
             voice: (modalCard.querySelector("#eVoice") || {}).value || "",
             persona: {
               expertise: modalCard.querySelector("#eExpertise").value,

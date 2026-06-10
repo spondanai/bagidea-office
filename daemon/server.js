@@ -195,6 +195,8 @@ function loadReg() {
   try { reg = JSON.parse(fs.readFileSync(REGISTRY, "utf8")); } catch { reg = {}; }
   reg.agents = reg.agents || {};
   reg.apiKeys = reg.apiKeys || {};      // ENV_NAME → value (injected into runs)
+  reg.backends = reg.backends || {};    // backend id → { kind, cmd, modelFlag, … } overrides
+  if (reg.officeModel === undefined) reg.officeModel = ""; // office-wide default model
   reg.channels = reg.channels || {};    // telegram/discord/line connector config
   // MAIN keys power program features (voice, TTS, image…). Canonical names —
   // migrate the short forms users typed before this distinction existed.
@@ -804,7 +806,7 @@ function dispatchJob(job) {
   if (job.mode === "now") job.done = true;
   saveJobs();
   broadcast({ type: "job.started", agent: job.agent, title: job.prompt.slice(0, 60), job: job.id });
-  runClaude(job.agent, job.prompt, {
+  runAgent(job.agent, job.prompt, {
     session: job.sessionKey || "new",
     logPrompt: "📋 [งานที่สั่งไว้] " + job.prompt,
     onEntry: (key) => { job.sessionKey = key; saveJobs(); },
@@ -904,6 +906,48 @@ SUB: <งานย่อยที่ชัดเจนครบถ้วนใ�
 ระบบจะสร้าง sub-agent โคลนของคุณรันขนานกันทันที แล้วส่งผลลัพธ์ทั้งหมดกลับมา
 ให้คุณสรุปเป็นคำตอบสุดท้ายเอง. งานเดี่ยวง่ายๆ ห้ามแตกร่าง — ทำเองตรงๆ.
 </system-capability>`;
+
+// ---- Multi-provider backends -------------------------------------------
+// Each agent can pick its own model AND its own CLI "backend". The "claude"
+// backend keeps the full integration (stream-json events, Security Center,
+// session resume); other backends (gemini/openai/custom) run in a simpler
+// capture mode (see runGeneric) but still animate the office, log, and take
+// part in delegation. Backends are configurable in reg.backends; sane
+// built-ins are merged underneath so the common ones work out of the box.
+const BUILTIN_BACKENDS = {
+  claude: { kind: "claude", cmd: "claude" },
+  // `echo <prompt> | gemini -m <model>` → final text on stdout.
+  gemini: { kind: "generic", cmd: "gemini", modelFlag: "-m", promptMode: "stdin" },
+  // OpenAI via the Codex CLI: `codex exec -m <model> "<prompt>"`.
+  openai: { kind: "generic", cmd: "codex", args: ["exec"], modelFlag: "-m", promptMode: "arg" },
+};
+function backendOf(a) {
+  const id = (a && a.backend) || "claude";
+  const conf = { ...(BUILTIN_BACKENDS[id] || {}), ...((reg.backends || {})[id] || {}) };
+  if (!conf.kind) conf.kind = id === "claude" ? "claude" : "generic";
+  if (!conf.cmd) conf.cmd = id;
+  return conf;
+}
+// Per-agent model wins, then the office default (OFFICE_MODEL env or
+// reg.officeModel), then the backend's own default (empty = no flag).
+function agentModel(a) {
+  return (a && a.model) || reg.officeModel || process.env.OFFICE_MODEL || "";
+}
+function claudeModelArgs(a) {
+  const m = agentModel(a);
+  return m ? ["--model", m] : [];
+}
+// The CLI binary for the claude backend (allows a custom path / wrapper).
+function claudeBin(a) {
+  return backendOf(a).cmd || "claude";
+}
+// Dispatcher: route a run to the right backend adapter.
+function runAgent(agent, prompt, opts = {}) {
+  const a = reg.agents[agent];
+  const be = backendOf(a);
+  if (be.kind === "generic") return runGeneric(agent, prompt, opts, be);
+  return runClaude(agent, prompt, opts);
+}
 
 function runClaude(agent, prompt, opts = {}) {
   const task = "t" + ++taskCounter;
@@ -1008,9 +1052,10 @@ function runClaude(agent, prompt, opts = {}) {
     // now run inside PROJECT directories, so the settings must travel
     // explicitly or the Security Center goes silent.
     "--settings", path.join(WORKSPACE, ".claude", "settings.json")];
+  args.push(...claudeModelArgs(a));
   if (mcpConfig) args.push("--mcp-config", mcpConfig);
   if (entry && entry.sid) args.push("--resume", entry.sid);
-  const child = spawn("claude", args, {
+  const child = spawn(claudeBin(a), args, {
     cwd,
     shell: true,
     env: { ...process.env, ...(reg.apiKeys || {}), OFFICE_ADAPTER: "1", OFFICE_AGENT: agent, OFFICE_TASK: task },
@@ -1155,6 +1200,108 @@ SPEAK: <ประโยคพูดสั้นๆ 1 ประโยค เป�
     fireDone("", false);
   });
   child.on("close", () => fireDone(lastText, !!lastText));
+  return task;
+}
+
+// Generic CLI backend — for non-Claude providers (Gemini, OpenAI/Codex, any
+// command). No stream-json / hooks / session resume: we capture stdout as the
+// final reply, animate the office (start → done), log it, and STILL run the
+// delegate-line parser so cross-backend hand-offs work. The agent walks and
+// works in the world just like a Claude one — it just thinks with a different
+// brain. `be` is the resolved backend config from backendOf().
+function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent])) {
+  const task = "t" + ++taskCounter;
+  const a = reg.agents[agent] || { name: agent, role: "Staff" };
+
+  // Session: reuse the latest thread or open a fresh one (text-only — generic
+  // backends don't resume by id, but the office thread log carries history).
+  let entry = null;
+  if (opts.session && opts.session !== "new")
+    entry = (sess[agent] || []).find((e) => e.key === opts.session);
+  else if (!opts.session) entry = latestSession(agent);
+  if (!entry) {
+    entry = { key: "s" + Date.now(), sid: null, ts: Date.now(),
+      title: String(opts.logPrompt || prompt).replace(/\s+/g, " ").slice(0, 48), log: [] };
+    sess[agent] = sess[agent] || [];
+    sess[agent].push(entry);
+  }
+  if (opts.project && projectDir(opts.project) && !entry.proj) entry.proj = opts.project;
+  const projId = entry.proj && projectDir(entry.proj) ? entry.proj : null;
+  const cwd = projId ? projectDir(projId) : WORKSPACE;
+  entry.log = entry.log || [];
+  entry.log.push({ who: "you", text: String(opts.logPrompt || prompt).slice(0, 4000), ts: Date.now() });
+  while (entry.log.length > 200) entry.log.shift();
+  saveSess();
+  if (opts.onEntry) try { opts.onEntry(entry.key); } catch {}
+
+  if (projId) {
+    projRuns[projId] = (projRuns[projId] || 0) + 1;
+    broadcast({ type: "projects.changed" }, false);
+  }
+  broadcast({ type: "task.started", agent, task, session: entry.key,
+    title: String(opts.logPrompt || prompt).replace(/\s+/g, " ").slice(0, 90) });
+  statBump("runs", agent);
+
+  // Persona preamble + a little recent context (generic backends are stateless,
+  // so we replay the tail of the thread for continuity).
+  let pre = `You are "${a.name}" (${a.role}).\n${personaText(a)}\n${memoryNote(agent)}\n`;
+  const hist = entry.log.slice(-9, -1)
+    .map((m) => `${m.who === "you" ? "User" : m.who === "agent" ? a.name : m.who}: ${m.text}`)
+    .join("\n");
+  if (hist) pre += `\nRecent conversation:\n${hist}\n`;
+  const fullPrompt = `${pre}\nTask: ${prompt}\n\nReply with your final answer only.`;
+
+  // argv: [...fixed args] [modelFlag model] [promptFlag? prompt(if arg mode)]
+  const argv = [...(be.args || [])];
+  const model = agentModel(a);
+  if (model && be.modelFlag) argv.push(be.modelFlag, model);
+  if (be.promptMode === "arg") {
+    if (be.promptFlag) argv.push(be.promptFlag);
+    argv.push(fullPrompt);
+  }
+
+  let child;
+  try {
+    child = spawn(be.cmd, argv, {
+      cwd, shell: false,
+      env: { ...process.env, ...(reg.apiKeys || {}), OFFICE_AGENT: agent, OFFICE_TASK: task },
+    });
+  } catch (e) {
+    broadcast({ type: "task.failed", agent, task, session: entry.key });
+    broadcast({ type: "chat.message", agent, task,
+      text: `⚠️ backend "${be.cmd}" ล้มเหลว: ${e.message}`, session: entry.key });
+    if (opts.onDone) try { opts.onDone("", false); } catch {}
+    return task;
+  }
+  if (be.promptMode !== "arg") {
+    try { child.stdin.write(fullPrompt); child.stdin.end(); } catch {}
+  }
+
+  let out = "", err = "", fired = false;
+  child.stdout.on("data", (c) => { out += c; });
+  child.stderr.on("data", (c) => { err += c; });
+  const finish = (ok, raw) => {
+    if (fired) return;
+    fired = true;
+    if (projId) {
+      projRuns[projId] = Math.max(0, (projRuns[projId] || 1) - 1);
+      broadcast({ type: "projects.changed" }, false);
+    }
+    let text = String(raw || "").trim();
+    if (!ok && !text) text = "⚠️ backend error: " + (err.trim().slice(0, 400) || "no output");
+    const shown = opts.filterText ? opts.filterText(text) : text;
+    if (shown) {
+      entry.log.push({ who: "agent", text: String(shown).slice(0, 8000), ts: Date.now() });
+      while (entry.log.length > 200) entry.log.shift();
+      saveSess();
+      broadcast({ type: "chat.message", agent, task, text: shown, session: entry.key });
+    }
+    broadcast({ type: ok ? "task.completed" : "task.failed", agent, task, session: entry.key });
+    statBump(ok ? "done" : "failed", null, 0);
+    if (opts.onDone) try { opts.onDone(text, ok); } catch (e) { console.error("[onDone]", e); }
+  };
+  child.on("error", (e) => finish(false, "backend spawn failed: " + e.message));
+  child.on("close", (code) => finish(code === 0, out));
   return task;
 }
 
@@ -1311,7 +1458,7 @@ function makeDelegateFilter(depth, session, onHit) {
           }
           const tl = sess[t] || [];
           const te = tl.length ? tl.reduce((a, b) => (a.ts > b.ts ? a : b)) : null;
-          runClaude(t, inst, {
+          runAgent(t, inst, {
             project: proj,
             session: proj && (!te || te.proj !== proj) ? "new" : undefined,
             onDone: (out, ok) => reportToMain(t, out, ok, depth, session),
@@ -1426,10 +1573,11 @@ function runSub(parentId, subId, taskText, entry, onDone) {
   const args = ["-p", "--output-format", "stream-json", "--verbose",
     "--allowedTools", tools,
     "--settings", path.join(WORKSPACE, ".claude", "settings.json")];
+  args.push(...claudeModelArgs(a));
   if (mcpConfig) args.push("--mcp-config", mcpConfig);
   // Ghosts work where their parent works (project-bound threads included).
   const subCwd = (entry.proj && projectDir(entry.proj)) || WORKSPACE;
-  const child = spawn("claude", args, {
+  const child = spawn(claudeBin(a), args, {
     cwd: subCwd, shell: true,
     env: { ...process.env, ...(reg.apiKeys || {}), OFFICE_ADAPTER: "1", OFFICE_AGENT: subId, OFFICE_TASK: entry.key },
   });
@@ -2195,7 +2343,7 @@ const server = http.createServer((req, res) => {
                 { session, project, logPrompt: prompt,
                   filterText: makeDelegateFilter(0, session),
                   onDone: wait ? (t, ok) => waited && waited(t, ok) : undefined })
-            : runClaude(agent, prompt, { session, project,
+            : runAgent(agent, prompt, { session, project,
                 onDone: wait ? (t, ok) => waited && waited(t, ok) : undefined });
         if (!wait) {
           res.writeHead(200, { "content-type": "application/json" });
@@ -2323,6 +2471,10 @@ const server = http.createServer((req, res) => {
           voice: String(p.voice !== undefined ? p.voice : cur.voice || "").slice(0, 20),
           skills: Array.isArray(p.skills) ? p.skills : cur.skills || [],
           tools: Array.isArray(p.tools) ? p.tools : cur.tools || [],
+          // Multi-provider: which model + CLI backend this agent runs on.
+          // "" model = office/CLI default; "claude" backend = full integration.
+          model: String(p.model !== undefined ? p.model : cur.model || "").slice(0, 60),
+          backend: String(p.backend !== undefined ? p.backend : cur.backend || "claude").slice(0, 40),
         };
         saveReg();
         pushRoster();

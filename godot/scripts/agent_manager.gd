@@ -136,6 +136,13 @@ func _fx(a: Dictionary, name: String, loops := 1) -> void:
 
 func handle(evt: Dictionary) -> void:
 	var type := str(evt.get("type", ""))
+	if type == "usage.overview":
+		# 📊 per-provider budget gauges on the wallpaper (no "agent" field, so
+		# intercept before the agent-less guard drops it).
+		var hud := get_node_or_null("../Hud")
+		if hud and hud.has_method("update_budgets"):
+			hud.update_budgets(evt.get("providers", []))
+		return
 	if type == "ui.daylight":
 		get_node("../").apply_daylight_event(evt)
 		return

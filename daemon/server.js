@@ -920,8 +920,11 @@ const BUILTIN_BACKENDS = {
   // on a trust prompt in headless cwd, so opt the workspace in via env.
   gemini: { kind: "generic", cmd: "gemini", modelFlag: "-m", promptMode: "stdin",
     env: { GEMINI_CLI_TRUST_WORKSPACE: "true" } },
-  // OpenAI via the Codex CLI: `codex exec -m <model> "<prompt>"`.
-  openai: { kind: "generic", cmd: "codex", args: ["exec"], modelFlag: "-m", promptMode: "arg" },
+  // OpenAI via the Codex CLI: `codex exec --skip-git-repo-check -m <model>
+  // -o <file> "<prompt>"` — read the clean final message from the -o file
+  // (stdout is mixed agent log). Default codex model is gpt-5.5.
+  openai: { kind: "generic", cmd: "codex", args: ["exec", "--skip-git-repo-check"],
+    modelFlag: "-m", promptMode: "arg", outFlag: "-o" },
 };
 function backendOf(a) {
   const id = (a && a.backend) || "claude";
@@ -977,6 +980,56 @@ function modelInfo(model, backend) {
   if (best) return best;
   return { limit: (DEFAULT_LIMIT[backend] || 200000), tier: "balanced", inUSD: 0, outUSD: 0 };
 }
+
+// ---- Provider budget windows: an at-a-glance "Claude X% · resets in Yh" per
+// provider, summed over a fixed window that resets like a quota. Budgets are
+// our own accounting (the CLIs don't expose remaining quota) — defaults are
+// rough; tune per plan via reg.providerBudgets ({ hours, budgetTok }).
+const PROVIDER_WINDOWS = {
+  claude: { hours: 5,  budgetTok: 5000000 },
+  gemini: { hours: 24, budgetTok: 10000000 },
+  openai: { hours: 5,  budgetTok: 3000000 },
+};
+const providerUse = {};   // provider -> { start, tok, cost }
+function providerOf(agent) {
+  const a = reg.agents[agent];
+  const id = (a && a.backend) || "claude";
+  return id;   // "claude" | "gemini" | "openai" | custom id
+}
+function providerCfg(p) {
+  return { ...(PROVIDER_WINDOWS[p] || { hours: 5, budgetTok: 5000000 }),
+    ...((reg.providerBudgets || {})[p] || {}) };
+}
+function trackProviderUse(provider, tok, cost) {
+  const cfg = providerCfg(provider);
+  const now = Date.now(), winMs = cfg.hours * 3600 * 1000;
+  let s = providerUse[provider];
+  if (!s || now - s.start >= winMs) s = providerUse[provider] = { start: now, tok: 0, cost: 0 };
+  s.tok += tok || 0;
+  s.cost += cost || 0;
+}
+function providersInPlay() {
+  const set = new Set(Object.keys(providerUse));
+  for (const a of Object.values(reg.agents)) set.add(a.backend || "claude");
+  return [...set];
+}
+function providerOverview() {
+  const now = Date.now();
+  return providersInPlay().map((p) => {
+    const cfg = providerCfg(p), winMs = cfg.hours * 3600 * 1000;
+    const s = providerUse[p];
+    let used = 0, resetInMs = winMs, cost = 0;
+    if (s && now - s.start < winMs) { used = s.tok; cost = s.cost; resetInMs = s.start + winMs - now; }
+    return { provider: p, used, budget: cfg.budgetTok,
+      pct: Math.min(100, Math.round((used / cfg.budgetTok) * 100)),
+      resetInMs, hours: cfg.hours, cost };
+  });
+}
+function broadcastOverview() {
+  broadcast({ type: "usage.overview", providers: providerOverview() }, false);
+}
+// Keep the office HUD's reset countdowns honest even when idle.
+setInterval(broadcastOverview, 60000);
 
 function runClaude(agent, prompt, opts = {}) {
   const task = "t" + ++taskCounter;
@@ -1222,6 +1275,8 @@ SPEAK: <ประโยคพูดสั้นๆ 1 ประโยค เป�
           broadcast({ type: "task.usage", agent, task, session: entry.key,
             model: mdl, ctx, out: outTok, total: ctx + outTok,
             limit: info.limit, cost: Number(m.total_cost_usd) || 0, est: false });
+          trackProviderUse(providerOf(agent), ctx + outTok, Number(m.total_cost_usd) || 0);
+          broadcastOverview();
         }
         broadcast({ type: m.is_error ? "task.failed" : "task.completed",
           agent, task, session: entry.key });
@@ -1299,6 +1354,13 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
   const argv = [...(be.args || [])];
   const model = agentModel(a);
   if (model && be.modelFlag) argv.push(be.modelFlag, model);
+  // Some CLIs (codex) write the clean final message to a file — stdout is the
+  // mixed agent log. Capture it there and read it back on finish.
+  let outFile = null;
+  if (be.outFlag) {
+    outFile = path.join(require("os").tmpdir(), `bagidea_${task}_${Date.now()}.txt`);
+    argv.push(be.outFlag, outFile);
+  }
   if (be.promptMode === "arg") {
     if (be.promptFlag) argv.push(be.promptFlag);
     argv.push(fullPrompt);
@@ -1332,6 +1394,11 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
       projRuns[projId] = Math.max(0, (projRuns[projId] || 1) - 1);
       broadcast({ type: "projects.changed" }, false);
     }
+    // Prefer the CLI's final-message file (codex) over noisy stdout.
+    if (outFile) {
+      try { const f = fs.readFileSync(outFile, "utf8"); if (f.trim()) raw = f; } catch {}
+      try { fs.unlinkSync(outFile); } catch {}
+    }
     let text = String(raw || "").trim();
     if (!ok && !text) text = "⚠️ backend error: " + (err.trim().slice(0, 400) || "no output");
     const shown = opts.filterText ? opts.filterText(text) : text;
@@ -1351,6 +1418,8 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
       broadcast({ type: "task.usage", agent, task, session: entry.key,
         model: model || a.backend, ctx: ctxEst, out: outEst, total: ctxEst + outEst,
         limit: info.limit, cost: 0, est: true });
+      trackProviderUse(providerOf(agent), ctxEst + outEst, 0);
+      broadcastOverview();
     }
     broadcast({ type: ok ? "task.completed" : "task.failed", agent, task, session: entry.key });
     statBump(ok ? "done" : "failed", null, 0);
@@ -3217,6 +3286,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
     res.end(JSON.stringify({ info: MODEL_INFO, defaultLimit: DEFAULT_LIMIT }));
 
+  } else if (req.method === "GET" && req.url === "/usage") {
+    // Per-provider budget overview (for the office HUD + overlay).
+    res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ providers: providerOverview() }));
+
   } else if (req.method === "GET" && req.url === "/stats") {
     // 📊 dashboard: last 7 days of run stats + live system facts.
     const days = [];
@@ -3809,6 +3883,10 @@ server.on("upgrade", (req, sock) => {
   );
   wsClients.add(sock);
   console.log("[oep] ws client connected", `(${wsClients.size})`);
+  // Prime the new client (overlay / office HUD) with the budget overview now,
+  // so the gauges show immediately instead of waiting for the next run.
+  try { sock.write(wsFrame(JSON.stringify({ type: "usage.overview",
+    providers: providerOverview(), ts: Date.now() }))); } catch {}
   sock.on("close", () => wsClients.delete(sock));
   sock.on("error", () => wsClients.delete(sock));
   sock.on("data", () => {}); // inbound frames (pings/close) — TCP close is enough

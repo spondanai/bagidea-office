@@ -556,21 +556,6 @@
     background: rgba(10, 14, 24, 0.5); border-top: 1px solid rgba(255,255,255,0.05);
   }
   #threadBar b { color: var(--accent); font-weight: 600; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* 🎚 realtime token gauge — context-window usage of the active agent */
-  #tokGauge { display: none; flex: none; margin: 4px 14px 0; padding: 6px 9px;
-    border: 1px solid var(--line); border-radius: 9px;
-    background: rgba(255,255,255,0.03); font-size: 11px; }
-  #tokGauge[data-on="1"] { display: block; }
-  .tgTop { display: flex; justify-content: space-between; align-items: center;
-    color: var(--dim); margin-bottom: 4px; }
-  #tgLabel { font-weight: 600; color: var(--text); overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; max-width: 62%; }
-  #tgPct { font-weight: 700; }
-  .tgBar { height: 7px; border-radius: 5px; background: rgba(255,255,255,0.08); overflow: hidden; }
-  #tgFill { height: 100%; width: 0; border-radius: 5px;
-    transition: width 0.4s ease, background 0.4s ease; }
-  .tgFoot { display: flex; justify-content: space-between; color: var(--dim);
-    margin-top: 3px; font-size: 10px; }
 
   /* ---------- settings / editor / ID-card modal ---------- */
   #modal {
@@ -789,11 +774,6 @@
   <span class="hint" id="pttHint"></span></div>
 
 <div id="threadBar">🧵 thread: <b id="threadName">ล่าสุด (ต่อเนื่องอัตโนมัติ)</b></div>
-<div id="tokGauge" data-on="0">
-  <div class="tgTop"><span id="tgLabel">🎚 tokens</span><span id="tgPct"></span></div>
-  <div class="tgBar"><div id="tgFill"></div></div>
-  <div class="tgFoot"><span id="tgNum"></span><span id="tgCost"></span></div>
-</div>
 <div id="attachRow"></div>
 <footer>
   <input id="inp" placeholder="Message Main… (Enter to send)" autofocus
@@ -1163,7 +1143,6 @@
     // The realtime call always reaches the main agent — offer it from the CEO seat too.
     document.getElementById("liveBtn").style.display = (id === "main" || id === "ceo") ? "" : "none";
     renderRail();
-    if (typeof renderGauge === "function") renderGauge();  // 🎚 show this agent's token gauge
     refreshThreadBar(true);  // clicking a seat always shows that agent's latest thread
   }
 
@@ -1732,42 +1711,6 @@
       box.appendChild(list);
     }
   }
-  // ---- 🎚 realtime token gauge — context-window usage per agent ----------
-  const usageByAgent = {};   // agent -> { ctx,out,limit,cost,model,est }
-  function fmtTok(n) {
-    n = Number(n) || 0;
-    return n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : String(n);
-  }
-  function renderGauge() {
-    const g = document.getElementById("tokGauge");
-    if (!g) return;
-    const u = usageByAgent[target] || usageByAgent.__last;
-    if (!u) { g.dataset.on = "0"; return; }
-    g.dataset.on = "1";
-    const limit = u.limit || 200000;
-    const pct = Math.min(100, Math.round((u.ctx / limit) * 100));
-    const fill = document.getElementById("tgFill");
-    fill.style.width = pct + "%";
-    fill.style.background = pct < 60
-      ? "linear-gradient(90deg,#3fb950,#2ea043)"
-      : pct < 85 ? "linear-gradient(90deg,#d29922,#bb8009)"
-                 : "linear-gradient(90deg,#f85149,#da3633)";
-    document.getElementById("tgLabel").textContent =
-      "🎚 " + (u.model || "—") + (u.est ? " (≈ประเมิน)" : "");
-    document.getElementById("tgPct").textContent = pct + "% context";
-    document.getElementById("tgNum").textContent =
-      fmtTok(u.ctx) + " / " + fmtTok(limit) + " tok · out " + fmtTok(u.out);
-    document.getElementById("tgCost").textContent =
-      u.cost ? "$" + Number(u.cost).toFixed(3) : (u.est ? "~ฟรี/ประเมิน" : "");
-  }
-  function updateGauge(ev) {
-    const u = { ctx: ev.ctx || 0, out: ev.out || 0, limit: ev.limit || 200000,
-      cost: ev.cost || 0, model: ev.model || "", est: !!ev.est };
-    usageByAgent[ev.agent] = u;
-    usageByAgent.__last = u;
-    renderGauge();
-  }
-
   // Concrete model choices per backend — no "default": every agent picks one.
   const MODEL_CHOICES = {
     claude: ["opus", "sonnet", "haiku"],
@@ -3946,7 +3889,6 @@
     // journals so they can never animate anything.
     if (ev.theater || String(ev.type).startsWith("theater.")) return;
     trackRunning(ev);  // 🔵 the NOW-WORKING strips (replays rebuild state)
-    if (ev.type === "task.usage") updateGauge(ev);  // 🎚 realtime token gauge
     feedRoute(ev);  // the 📡 feed mirrors everything glanceable
 
     // Ghost traffic peels off before anything can mint a rail seat for it.

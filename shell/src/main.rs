@@ -159,7 +159,10 @@ const BUDGET_HTML: &str = r#"<!doctype html>
   function render(ps){
     const el=document.getElementById("rows");
     if(!ps||!ps.length){el.innerHTML='<div style="color:#6b7a93;font-size:10px">— ยังไม่มีการใช้งาน —</div>';return}
-    el.innerHTML=ps.map(p=>{const pct=p.pct||0;return `<div class="row"><div class="rtop"><span class="rname">${NAME[p.provider]||p.provider} ${pct}%</span><span class="rreset">⟳ ${fmtReset(p.resetInMs)} · ${fmtTok(p.used)}/${fmtTok(p.budget)}</span></div><div class="bar"><div class="fill" style="width:${pct}%;background:${color(pct)}"></div></div></div>`}).join("")
+    el.innerHTML=ps.map(p=>{const pct=p.pct||0;const live=p.source==='live';
+      const mark=live?'<span style="color:#3fb950" title="ของจริงจาก /usage">●</span>':'<span style="color:#8a99b3" title="ประเมินจาก office">≈</span>';
+      const right=live?('⟳ '+fmtReset(p.resetInMs)):('⟳ '+fmtReset(p.resetInMs)+' · '+fmtTok(p.used)+'/'+fmtTok(p.budget));
+      return `<div class="row"><div class="rtop"><span class="rname">${NAME[p.provider]||p.provider} ${pct}% ${mark}</span><span class="rreset">${right}</span></div><div class="bar"><div class="fill" style="width:${pct}%;background:${color(pct)}"></div></div></div>`}).join("")
   }
   fetch("http://127.0.0.1:8787/usage").then(r=>r.json()).then(d=>render(d.providers)).catch(()=>{});
   function wire(){try{const ws=new WebSocket('ws://127.0.0.1:8787/ws');ws.onmessage=m=>{try{const e=JSON.parse(m.data);if(e.type==='usage.overview')render(e.providers)}catch{}};ws.onclose=()=>setTimeout(wire,4000)}catch{setTimeout(wire,4000)}}

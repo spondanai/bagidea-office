@@ -1013,6 +1013,35 @@ function providersInPlay() {
   for (const a of Object.values(reg.agents)) set.add(a.backend || "claude");
   return [...set];
 }
+// REAL Claude quota: `claude -p "/usage"` prints the live subscription window
+// (the same numbers as the interactive /usage). We poll it and use the true
+// session % + reset for the claude gauge; gemini/codex have no headless quota
+// command, so they stay on the office-usage estimate.
+let claudeUsageState = { sessionPct: null, sessionReset: "", weekPct: null, weekReset: "", ts: 0 };
+function parseResetMs(label) {
+  try {
+    const now = new Date();
+    let t = String(label).replace(/\s*\(.*\)\s*$/, "").replace(/\s+at\s+/i, " ").trim();
+    t = t.replace(/(\d)\s*(am|pm)/i, "$1 $2");           // 7:10pm -> 7:10 pm
+    let d = new Date(t + " " + now.getFullYear());
+    if (isNaN(d.getTime())) return null;
+    if (d.getTime() < now.getTime() - 60000) d.setFullYear(now.getFullYear() + 1);
+    return Math.max(0, d.getTime() - now.getTime());
+  } catch { return null; }
+}
+function pollClaudeUsage() {
+  const { execFile } = require("child_process");
+  execFile("claude", ["-p", "/usage"], { timeout: 30000 }, (err, out) => {
+    if (err || !out) return;
+    const sess = out.match(/Current session:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
+    const week = out.match(/Current week[^:]*:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
+    if (sess) { claudeUsageState.sessionPct = +sess[1]; claudeUsageState.sessionReset = sess[2].trim(); }
+    if (week) { claudeUsageState.weekPct = +week[1]; claudeUsageState.weekReset = week[2].trim(); }
+    claudeUsageState.ts = Date.now();
+    if (sess || week) broadcastOverview();
+  });
+}
+
 function providerOverview() {
   const now = Date.now();
   return providersInPlay().map((p) => {
@@ -1020,9 +1049,19 @@ function providerOverview() {
     const s = providerUse[p];
     let used = 0, resetInMs = winMs, cost = 0;
     if (s && now - s.start < winMs) { used = s.tok; cost = s.cost; resetInMs = s.start + winMs - now; }
-    return { provider: p, used, budget: cfg.budgetTok,
-      pct: Math.min(100, Math.round((used / cfg.budgetTok) * 100)),
-      resetInMs, hours: cfg.hours, cost };
+    let pct = Math.min(100, Math.round((used / cfg.budgetTok) * 100));
+    let resetLabel = "", source = "est";
+    // Live Claude subscription window overrides the estimate.
+    if (p === "claude" && claudeUsageState.sessionPct != null && now - claudeUsageState.ts < 12 * 60000) {
+      pct = claudeUsageState.sessionPct;
+      resetLabel = claudeUsageState.sessionReset;
+      const ms = parseResetMs(claudeUsageState.sessionReset);
+      if (ms != null) resetInMs = ms;
+      source = "live";
+    }
+    return { provider: p, used, budget: cfg.budgetTok, pct, resetInMs, resetLabel,
+      hours: cfg.hours, cost, source,
+      week: p === "claude" ? { pct: claudeUsageState.weekPct, reset: claudeUsageState.weekReset } : undefined };
   });
 }
 function broadcastOverview() {
@@ -1030,6 +1069,9 @@ function broadcastOverview() {
 }
 // Keep the office HUD's reset countdowns honest even when idle.
 setInterval(broadcastOverview, 60000);
+// Poll the real Claude quota now and every 4 minutes (cheap slash command).
+setTimeout(pollClaudeUsage, 3000);
+setInterval(pollClaudeUsage, 240000);
 
 function runClaude(agent, prompt, opts = {}) {
   const task = "t" + ++taskCounter;

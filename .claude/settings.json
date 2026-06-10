@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "node \"/Users/mr.poring/bagidea-office-mine/daemon/hook.js\" task.started" } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "node \"/Users/mr.poring/bagidea-office-mine/daemon/hook.js\" task.progress" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "node \"/Users/mr.poring/bagidea-office-mine/daemon/hook.js\" task.completed" } ] }
+    ]
+  }
+}

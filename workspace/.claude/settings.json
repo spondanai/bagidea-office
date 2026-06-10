@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      { "hooks": [ { "type": "command", "command": "node \"/Users/mr.poring/bagidea-office-mine/daemon/perm.js\"", "timeout": 60 } ] }
+    ]
+  }
+}

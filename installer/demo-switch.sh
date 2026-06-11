@@ -32,7 +32,7 @@ echo "  ==========================================="
 #    PATH wiring, so kill the processes directly - same sweep as update-mac.sh.
 #    This also frees the shell binary the rebuild is about to overwrite.
 echo ""
-echo "  [1/4] Stopping the running office..."
+echo "  [1/5] Stopping the running office..."
 pkill -f "node.*server\.js"        || true
 pkill -f "bagidea-office-shell"    || true
 pkill -f "Godot"                   || true
@@ -45,7 +45,7 @@ sleep 1
 #    that pull a no-op fast-forward. Data files are gitignored, so they stay.
 if [ -d "$APP/.git" ]; then
   echo ""
-  echo "  [2/4] Pointing the existing install at the fork..."
+  echo "  [2/5] Pointing the existing install at the fork..."
   git -C "$APP" remote set-url origin "$REPO"
   git -C "$APP" fetch origin "$BRANCH"
   git -C "$APP" checkout -B "$BRANCH" "origin/$BRANCH"
@@ -53,15 +53,42 @@ if [ -d "$APP/.git" ]; then
   echo "      origin -> $REPO ($BRANCH)"
 else
   echo ""
-  echo "  [2/4] No existing install - the installer will clone fresh."
+  echo "  [2/5] No existing install - the installer will clone fresh."
 fi
 
-# 3) Hand off to the installer FROM THE SAME fork/branch (so the bare-machine
+# 3) Install/start onWatch (API quota monitor) — non-interactive.
+#    Pre-write ~/.onwatch/.env so the setup wizard is never shown.
+#    onWatch auto-detects Claude Code credentials from ~/.claude/.credentials.json;
+#    no token entry needed. The daemon falls back to `claude -p "/usage"` if
+#    onWatch hasn't synced yet.
+echo ""
+echo "  [3/5] Setting up onWatch (token quota monitor)..."
+ONWATCH_ENV="$HOME/.onwatch/.env"
+if command -v onwatch &>/dev/null || [ -d "$HOME/.onwatch" ]; then
+  echo "      already installed — ensuring service is running"
+else
+  curl -fsSL https://raw.githubusercontent.com/onllm-dev/onwatch/main/install.sh | bash
+fi
+# Write minimal .env to skip the interactive wizard on first run.
+mkdir -p "$HOME/.onwatch"
+if [ ! -f "$ONWATCH_ENV" ]; then
+  cat > "$ONWATCH_ENV" <<'ENV'
+ONWATCH_ADMIN_USER=admin
+ONWATCH_ADMIN_PASS=bagidea
+ENV
+  echo "      config written — Claude Code credentials auto-detected"
+fi
+# Start onWatch service in background if not already running.
+if command -v onwatch &>/dev/null; then
+  onwatch start 2>/dev/null || true
+fi
+
+# 4) Hand off to the installer FROM THE SAME fork/branch (so the bare-machine
 #    dependency bootstrap + Godot download ride along). It clones (if missing),
 #    installs deps, downloads Godot, and runs build-mac.sh. Derive the raw URL
 #    from $REPO/$BRANCH so an override fetches the matching installer.
 echo ""
-echo "  [3/4] Installing the demo (deps + Godot + rebuild - can take a few minutes)..."
+echo "  [4/5] Installing the demo (deps + Godot + rebuild - can take a few minutes)..."
 RAW_BASE="$(printf '%s' "${REPO%.git}" | sed -E 's#^https://github.com/#https://raw.githubusercontent.com/#')"
 INSTALLER_URL="$RAW_BASE/$BRANCH/installer/install-mac.sh"
 curl -fsSL "$INSTALLER_URL" | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
@@ -69,7 +96,7 @@ curl -fsSL "$INSTALLER_URL" | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
 # 4) Launch the demo (detached). The native shell spawns the daemon + Godot
 #    wallpaper + chat orb itself; quit from the menu-bar tray icon.
 echo ""
-echo "  [4/4] Launching the demo..."
+echo "  [5/5] Launching the demo..."
 EXE="$APP/shell/target/release/bagidea-office-shell"
 if [ -x "$EXE" ]; then
   ( cd "$APP" && nohup "$EXE" >/tmp/bagidea-shell.log 2>&1 & )

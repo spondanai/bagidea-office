@@ -60,37 +60,51 @@ if (Test-Path (Join-Path $APP ".git")) {
 }
 
 # 3) Install/start onWatch (API quota monitor) — non-interactive.
-#    Pre-write %USERPROFILE%\.onwatch\.env so the setup wizard is skipped.
+#    Download the binary directly (avoids hanging irm|iex nesting).
+#    Pre-write %USERPROFILE%\.onwatch\.env so the setup wizard is never shown.
 #    onWatch auto-detects Claude Code credentials from ~\.claude\.credentials.json.
 Step "[3/5] Setting up onWatch (token quota monitor)..."
+$onwatchDir    = Join-Path $env:USERPROFILE ".onwatch\bin"
+$onwatchExe    = Join-Path $onwatchDir "onwatch.exe"
 $onwatchEnvDir = Join-Path $env:USERPROFILE ".onwatch"
 $onwatchEnv    = Join-Path $onwatchEnvDir ".env"
-$onwatchBin    = $null
-# Locate existing binary (might be in PATH or AppData).
+
+# Check PATH first, then the canonical install location.
 $onwatchBin = Get-Command onwatch -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+if (-not $onwatchBin -and (Test-Path $onwatchExe)) { $onwatchBin = $onwatchExe }
+
 if (-not $onwatchBin) {
-  $candidate = Join-Path $env:LOCALAPPDATA "onwatch\onwatch.exe"
-  if (Test-Path $candidate) { $onwatchBin = $candidate }
+  # Download the binary directly — no sub-installer, no hanging pipe.
+  New-Item -ItemType Directory -Force -Path $onwatchDir | Out-Null
+  $ProgressPreference = "SilentlyContinue"
+  try {
+    Invoke-WebRequest -Uri "https://github.com/onllm-dev/onwatch/releases/latest/download/onwatch-windows-amd64.exe" `
+                      -OutFile $onwatchExe -UseBasicParsing
+    $onwatchBin = $onwatchExe
+    Ok "downloaded -> $onwatchExe"
+  } catch {
+    Warn "could not download onWatch ($_) — token budget will fall back to claude CLI"
+  }
+  $ProgressPreference = "Continue"
+} else {
+  Ok "already installed -> $onwatchBin"
 }
-if (-not $onwatchBin) {
-  # Fresh install.
-  irm https://raw.githubusercontent.com/onllm-dev/onwatch/main/install.ps1 | iex
-  $onwatchBin = Get-Command onwatch -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
-}
-# Pre-write .env so the wizard is never shown.
-if (-not (Test-Path $onwatchEnvDir)) { New-Item -ItemType Directory -Path $onwatchEnvDir | Out-Null }
+
+# Pre-write .env so the wizard is never shown on first run.
+New-Item -ItemType Directory -Force -Path $onwatchEnvDir | Out-Null
 if (-not (Test-Path $onwatchEnv)) {
   Set-Content -Path $onwatchEnv -Value "ONWATCH_ADMIN_USER=admin`nONWATCH_ADMIN_PASS=bagidea" -Encoding UTF8
   Ok "config written — Claude Code credentials auto-detected"
 } else {
   Ok "config already present"
 }
+
 # Start onWatch service (no-op if already running).
 if ($onwatchBin) {
   & $onwatchBin start 2>$null | Out-Null
   Ok "onWatch service started"
 } else {
-  Warn "onWatch binary not found after install — token budget may show 0% initially"
+  Warn "onWatch not available — token budget may show 0% initially"
 }
 
 # 4) Hand off to the canonical installer with the fork/branch override. It does

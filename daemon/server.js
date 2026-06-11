@@ -4088,22 +4088,20 @@ const server = http.createServer((req, res) => {
   } else if (req.method === "POST" && req.url === "/update") {
     // Human-triggered only (in-app 🔄 button or the CLI).
     if (!req.headers["x-bagidea-ui"]) { res.writeHead(403); return res.end("human UI only"); }
-    if (process.platform !== "win32") {
-      // The in-app updater is the Windows update.ps1 flow; macOS updates run
-      // build-mac.sh manually. Don't spawn a missing cmd.exe (it would crash
-      // the daemon via an unhandled spawn error).
-      res.writeHead(501, { "content-type": "text/plain; charset=utf-8" });
-      return res.end("อัปเดตในแอปยังไม่รองรับบน macOS — รัน ./build-mac.sh เองนะครับ");
+    if (process.platform === "win32") {
+      const ps = path.join(__dirname, "..", "installer", "update.ps1");
+      spawn("cmd.exe", ["/c", "start", "BagIdea Update", "powershell",
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
+        { detached: true, stdio: "ignore", windowsHide: false })
+        .on("error", (e) => console.error("[update]", e.message)).unref();
+      res.writeHead(200); res.end("ok");
+    } else {
+      const sh = path.join(__dirname, "..", "installer", "update-mac.sh");
+      const osa = `tell application "Terminal"\n  do script "bash '${sh}'"\n  activate\nend tell`;
+      spawn("osascript", ["-e", osa], { detached: true })
+        .on("error", (e) => console.error("[update]", e.message)).unref();
+      res.writeHead(200); res.end("ok");
     }
-    const ps = path.join(__dirname, "..", "installer", "update.ps1");
-    // Launch in a REAL, visible console window via `cmd start` so the user can
-    // watch git pull + the rebuild — a silent detached process looked hung. It
-    // also outlives this daemon (the updater kills + relaunches the whole suite).
-    spawn("cmd.exe", ["/c", "start", "BagIdea Update", "powershell",
-      "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-      { detached: true, stdio: "ignore", windowsHide: false })
-      .on("error", (e) => console.error("[update]", e.message)).unref();
-    res.writeHead(200); res.end("ok");
 
   } else if (req.url === "/health") {
     res.writeHead(200, { "content-type": "application/json" });

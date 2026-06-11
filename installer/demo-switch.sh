@@ -56,12 +56,15 @@ else
   echo "  [2/4] No existing install - the installer will clone fresh."
 fi
 
-# 3) Hand off to the canonical installer with the fork/branch override. It clones
-#    (if missing) and runs build-mac.sh: wallpaper shim + Rust shell + hook wiring.
+# 3) Hand off to the installer FROM THE SAME fork/branch (so the bare-machine
+#    dependency bootstrap + Godot download ride along). It clones (if missing),
+#    installs deps, downloads Godot, and runs build-mac.sh. Derive the raw URL
+#    from $REPO/$BRANCH so an override fetches the matching installer.
 echo ""
-echo "  [3/4] Installing the demo (this rebuilds the shell - can take a few minutes)..."
-curl -fsSL https://raw.githubusercontent.com/bagidea/bagidea-office/main/installer/install-mac.sh \
-  | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
+echo "  [3/4] Installing the demo (deps + Godot + rebuild - can take a few minutes)..."
+RAW_BASE="$(printf '%s' "${REPO%.git}" | sed -E 's#^https://github.com/#https://raw.githubusercontent.com/#')"
+INSTALLER_URL="$RAW_BASE/$BRANCH/installer/install-mac.sh"
+curl -fsSL "$INSTALLER_URL" | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
 
 # 4) Launch the demo (detached). The native shell spawns the daemon + Godot
 #    wallpaper + chat orb itself; quit from the menu-bar tray icon.

@@ -56,25 +56,12 @@ else
   echo "  [2/4] No existing install - the installer will clone fresh."
 fi
 
-# 3) Install onWatch (API quota monitor) if not already present.
-#    onWatch writes ~/.onwatch/data/onwatch.db which the daemon reads for real
-#    Claude/Gemini/Codex quota — without it the Token Budget panel shows 0%.
-echo ""
-echo "  [3/5] Checking onWatch (API quota monitor)..."
-if command -v onwatch &>/dev/null || [ -d "$HOME/.onwatch" ]; then
-  echo "      already installed — skipping"
-else
-  echo "      installing onWatch…"
-  curl -fsSL https://raw.githubusercontent.com/onllm-dev/onwatch/main/install.sh | bash
-  echo "      onWatch installed ✓"
-fi
-
-# 4) Hand off to the installer FROM THE SAME fork/branch (so the bare-machine
+# 3) Hand off to the installer FROM THE SAME fork/branch (so the bare-machine
 #    dependency bootstrap + Godot download ride along). It clones (if missing),
 #    installs deps, downloads Godot, and runs build-mac.sh. Derive the raw URL
 #    from $REPO/$BRANCH so an override fetches the matching installer.
 echo ""
-echo "  [4/5] Installing the demo (deps + Godot + rebuild - can take a few minutes)..."
+echo "  [3/4] Installing the demo (deps + Godot + rebuild - can take a few minutes)..."
 RAW_BASE="$(printf '%s' "${REPO%.git}" | sed -E 's#^https://github.com/#https://raw.githubusercontent.com/#')"
 INSTALLER_URL="$RAW_BASE/$BRANCH/installer/install-mac.sh"
 curl -fsSL "$INSTALLER_URL" | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
@@ -82,7 +69,7 @@ curl -fsSL "$INSTALLER_URL" | BAGIDEA_REPO="$REPO" BAGIDEA_BRANCH="$BRANCH" bash
 # 4) Launch the demo (detached). The native shell spawns the daemon + Godot
 #    wallpaper + chat orb itself; quit from the menu-bar tray icon.
 echo ""
-echo "  [5/5] Launching the demo..."
+echo "  [4/4] Launching the demo..."
 EXE="$APP/shell/target/release/bagidea-office-shell"
 if [ -x "$EXE" ]; then
   ( cd "$APP" && nohup "$EXE" >/tmp/bagidea-shell.log 2>&1 & )

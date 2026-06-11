@@ -59,20 +59,7 @@ if (Test-Path (Join-Path $APP ".git")) {
   Ok "origin -> $Repo"
 }
 
-# 3) Install onWatch (API quota monitor) if not already present.
-#    onWatch writes %USERPROFILE%\.onwatch\data\onwatch.db which the daemon reads
-#    for real Claude/Gemini/Codex quota — without it the Token Budget panel shows 0%.
-Step "Checking onWatch (API quota monitor)..."
-$owDb = Join-Path $env:USERPROFILE ".onwatch"
-if ((Get-Command onwatch -ErrorAction SilentlyContinue) -or (Test-Path $owDb)) {
-  Ok "already installed — skipping"
-} else {
-  Ok "installing onWatch…"
-  irm https://raw.githubusercontent.com/onllm-dev/onwatch/main/install.ps1 | iex
-  Ok "onWatch installed"
-}
-
-# 4) Hand off to the canonical installer with the fork/branch override. It does
+# 3) Hand off to the canonical installer with the fork/branch override. It does
 #    the heavy lifting: fetch + reset --hard to the branch, rebuild the Rust
 #    shell, re-brand the icon, rewire hooks, refresh the Start Menu shortcut.
 Step "Installing the demo (this rebuilds the shell - can take a few minutes)..."

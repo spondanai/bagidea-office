@@ -646,6 +646,7 @@ mod platform {
 
     unsafe extern "system" fn occl_cb(h: HWND, lp: windows_sys::Win32::Foundation::LPARAM) -> i32 {
         use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
         use windows_sys::Win32::Graphics::Gdi::{
             GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
         };
@@ -660,12 +661,18 @@ mod platform {
         if pid == scan.own_pid {
             return 1;
         }
-        // Skip the desktop shell itself (Progman / WorkerW / SHELLDLL_DefView) —
-        // those ARE full-screen and would always read as "covered".
-        let mut cls = [0u16; 32];
+        // Skip the desktop shell and common full-screen system overlays that
+        // aren't real app windows and would always read as "covered".
+        let mut cls = [0u16; 64];
         let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
         let name = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
-        if name == "Progman" || name == "WorkerW" || name == "SHELLDLL_DefView" {
+        if matches!(name.as_str(),
+            "Progman" | "WorkerW" | "SHELLDLL_DefView" |
+            "Shell_TrayWnd" | "Shell_SecondaryTrayWnd" |  // taskbar
+            "DV2ControlHost" |                             // start menu
+            "Windows.UI.Core.CoreWindow" |                // Win11 overlays
+            "ApplicationFrameWindow"                       // UWP container
+        ) {
             return 1;
         }
         // Only windows on the PRIMARY monitor (where the wallpaper lives) count;
@@ -679,15 +686,26 @@ mod platform {
         if mi.dwFlags & 1 == 0 { // 1 = MONITORINFOF_PRIMARY
             return 1;
         }
+        // Prefer DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) — it returns
+        // the VISIBLE window bounds, excluding the invisible DWM drop-shadow that
+        // GetWindowRect includes (~8px per side on Windows 11). Without this, any
+        // normal window near the screen edge passes the coverage threshold and the
+        // wallpaper stays permanently throttled at 2 fps.
         let mut wr: RECT = std::mem::zeroed();
-        if GetWindowRect(h, &mut wr) == 0 {
-            return 1;
+        let dwm_ok = DwmGetWindowAttribute(
+            h,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut wr as *mut RECT as *mut _,
+            std::mem::size_of::<RECT>() as u32,
+        ) == 0; // S_OK == 0
+        if !dwm_ok {
+            if GetWindowRect(h, &mut wr) == 0 { return 1; }
         }
         let mw = (mi.rcMonitor.right - mi.rcMonitor.left) as f64;
         let mh = (mi.rcMonitor.bottom - mi.rcMonitor.top) as f64;
         let ww = (wr.right - wr.left) as f64;
         let hh = (wr.bottom - wr.top) as f64;
-        // Maximized leaves the taskbar (~4%) uncovered: ≥98% width, ≥88% height.
+        // True-fullscreen or maximised (leaves ≤12% taskbar gap): ≥98% w, ≥88% h.
         if ww >= mw * 0.98 && hh >= mh * 0.88 {
             scan.occluded = true;
             return 0; // found a coverer — stop enumerating

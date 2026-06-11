@@ -405,18 +405,31 @@ function latestSession(agent) {
 }
 
 // Plain headless claude call → final text (prompt drafting, reflections).
-function claudeText(prompt) {
+function claudeText(prompt, modelOverride) {
   return new Promise((resolve) => {
-    const child = spawn("claude", ["-p"], {
+    // Reflection / prompt-drafting are light structured tasks (classify a tool
+    // trail, emit strict JSON) — well within a small model's reach. Pin them to
+    // a cheap model instead of inheriting the CLI's default (often Opus, ~5x the
+    // cost). Override via reg.reflectModel if you want a stronger distiller.
+    const model = modelOverride || reg.reflectModel || "claude-haiku-4-5";
+    const child = spawn("claude", ["-p", "--model", model], {
       cwd: WORKSPACE, shell: true,
       env: { ...process.env, ...(reg.apiKeys || {}), OFFICE_ADAPTER: "1" },
     });
     child.stdin.write(prompt);
     child.stdin.end();
-    let out = "";
+    let out = "", err = "";
     child.stdout.on("data", (c) => (out += c));
-    child.on("close", () => resolve(out.trim()));
-    child.on("error", () => resolve(""));
+    child.stderr.on("data", (c) => (err += c));
+    child.on("close", () => {
+      // Surface failures instead of swallowing them — a bad model id or quota
+      // limit would otherwise return "" silently and a meeting/reflection would
+      // look "empty" with no clue why.
+      if (!out.trim() && err.trim())
+        console.error(`[claudeText] empty result (model=${model}):`, err.trim().slice(0, 300));
+      resolve(out.trim());
+    });
+    child.on("error", (e) => { console.error("[claudeText] spawn", e.message); resolve(""); });
   });
 }
 
@@ -631,6 +644,11 @@ let projects = loadJson(PROJECTS_FILE, []);  // {id, name, dir, ts, created}
 // create flow (browse-registering didn't exist yet) — they're ours.
 let migrated = false;
 for (const p of projects) if (p.created === undefined) { p.created = true; migrated = true; }
+// macOS migration: earlier builds stored backslash paths ("\Users\...") which
+// are invalid as a cwd / cd target on POSIX — restore forward slashes.
+if (process.platform !== "win32")
+  for (const p of projects)
+    if (p.dir && p.dir.includes("\\")) { p.dir = p.dir.replace(/\\/g, "/"); migrated = true; }
 const saveProjects = () => fs.writeFileSync(PROJECTS_FILE, JSON.stringify(projects, null, 2));
 if (migrated) saveProjects();
 let projWin = {};           // project id -> visible (true) / hidden (false)
@@ -641,6 +659,10 @@ const WINPROJ = path.join(__dirname, "winproj.ps1");
 const LIVEVIEW = path.join(__dirname, "liveview.ps1");
 
 function winproj(action, id, cb) {
+  // Window tracking (sweep/hide/show/stop) is a Windows-only feature built on
+  // winproj.ps1. On macOS there's no equivalent yet — no-op so the 5s sweep and
+  // the hide/resume/stop endpoints don't spawn a missing PowerShell every tick.
+  if (process.platform !== "win32") { cb && cb(null, ""); return; }
   const { execFile } = require("child_process");
   execFile("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass",
     "-File", WINPROJ, action, String(id || "")],
@@ -695,7 +717,9 @@ function createProject(name, place, pathArg) {
   let dir = String(pathArg || "").trim();
   if (!dir && place && reg.places[place]) dir = path.join(reg.places[place], name);
   if (!dir) throw new Error("need place or path");
-  dir = dir.replace(/\//g, "\\");
+  // Windows wants backslash paths; POSIX (macOS) must keep forward slashes —
+  // mangling them to "\Users\..." breaks cwd, cd, and the folder picker.
+  if (process.platform === "win32") dir = dir.replace(/\//g, "\\");
   // Separator-proof normalization for every duplicate check.
   const norm = (s) => String(s).replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
   if (projects.some((x) => norm(x.dir) === norm(dir)))
@@ -968,6 +992,53 @@ function runAgent(agent, prompt, opts = {}) {
   return runClaude(agent, prompt, opts);
 }
 
+// Meetings/brainstorms run cheap no matter what an agent is configured for —
+// force each provider's economy tier (overridable per backend via
+// reg.meetingModels). Unlisted backends fall back to the agent's own model.
+// gemini-3-flash-preview is the cheapest flash the gemini CLI accepts here
+// (gemini-flash-latest / gemini-2.0-flash 404 on this CLI build; 2.5-flash also
+// works as a stable fallback). Verified 2026-06-11.
+const MEETING_MODEL = { claude: "claude-haiku-4-5", gemini: "gemini-3-flash-preview" };
+function meetingModel(a) {
+  const id = (a && a.backend) || "claude";
+  return (reg.meetingModels && reg.meetingModels[id]) || MEETING_MODEL[id] || agentModel(a) || "";
+}
+
+// One lightweight discussion turn, routed through the agent's OWN backend so a
+// meeting can be genuinely cross-model (Claude + Gemini + Codex sharing the one
+// daemon-held transcript). Returns the turn's final text ("" on failure, logged).
+function backendText(agent, prompt) {
+  const a = reg.agents[agent] || { name: agent, role: "Staff" };
+  const be = backendOf(a);
+  const model = meetingModel(a);
+  if (be.kind !== "generic") return claudeText(prompt, model);   // claude backend
+  return new Promise((resolve) => {
+    const argv = [...(be.args || [])];
+    if (model && be.modelFlag) argv.push(be.modelFlag, model);
+    let outFile = null;
+    if (be.outFlag) {
+      outFile = path.join(require("os").tmpdir(), `bagidea_disc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.txt`);
+      argv.push(be.outFlag, outFile);
+    }
+    if (be.promptMode === "arg") { if (be.promptFlag) argv.push(be.promptFlag); argv.push(prompt); }
+    const child = spawn(be.cmd, argv, {
+      cwd: WORKSPACE, env: { ...process.env, ...(reg.apiKeys || {}), ...(be.env || {}) },
+    });
+    if (be.promptMode !== "arg") { try { child.stdin.write(prompt); child.stdin.end(); } catch {} }
+    let out = "", err = "";
+    child.stdout.on("data", (c) => (out += c));
+    child.stderr.on("data", (c) => (err += c));
+    child.on("close", () => {
+      let text = out.trim();
+      if (outFile) { try { text = fs.readFileSync(outFile, "utf8").trim(); } catch {} fs.unlink(outFile, () => {}); }
+      if (!text && err.trim())
+        console.error(`[backendText:${be.cmd} ${model}]`, err.trim().slice(0, 300));
+      resolve(text);
+    });
+    child.on("error", (e) => { console.error(`[backendText:${be.cmd}] spawn`, e.message); resolve(""); });
+  });
+}
+
 // ---- Model economics: context-window limits + price tiers. Powers the
 // realtime token gauge and the per-role "best value" recommendation. Numbers
 // are approximate (providers change them); matched by longest name substring.
@@ -1035,6 +1106,7 @@ function providersInPlay() {
 // session % + reset for the claude gauge; gemini/codex have no headless quota
 // command, so they stay on the office-usage estimate.
 let claudeUsageState = { sessionPct: null, sessionReset: "", weekPct: null, weekReset: "", ts: 0 };
+let pollingClaude = false;
 function parseResetMs(label) {
   try {
     const now = new Date();
@@ -1047,8 +1119,11 @@ function parseResetMs(label) {
   } catch { return null; }
 }
 function pollClaudeUsage() {
+  if (pollingClaude) return;
+  pollingClaude = true;
   const { execFile } = require("child_process");
   execFile("claude", ["-p", "/usage"], { timeout: 30000 }, (err, out) => {
+    pollingClaude = false;
     if (err || !out) return;
     const sess = out.match(/Current session:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
     const week = out.match(/Current week[^:]*:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
@@ -1123,7 +1198,12 @@ function providerOverview() {
     let pct = Math.min(100, Math.round((used / cfg.budgetTok) * 100));
     let resetLabel = "", source = "est", model = "";
     const ow = onwatchState[p];
-    if (ow && now - ow.ts < 6 * 60000) {
+    // Trust onWatch only when its DATA is fresh — not just when WE last polled.
+    // A reset timestamp far in the past means onWatch hasn't logged the new
+    // window (its quota row is stale); showing it would freeze the gauge.
+    const owFresh = ow && now - ow.ts < 6 * 60000 &&
+      (ow.resetMs == null || isNaN(ow.resetMs) || ow.resetMs > -5 * 60000);
+    if (owFresh) {
       // Real provider quota from onWatch wins for every provider.
       pct = ow.pct;
       if (ow.resetMs != null && !isNaN(ow.resetMs)) resetInMs = Math.max(0, ow.resetMs);
@@ -1150,10 +1230,44 @@ setInterval(broadcastOverview, 60000);
 // Prefer onWatch (real quota, all providers); fall back to claude -p "/usage".
 if (onwatchRunning()) {
   setTimeout(pollOnwatch, 1500);
-  setInterval(pollOnwatch, 60000);
-} else {
-  setTimeout(pollClaudeUsage, 3000);
-  setInterval(pollClaudeUsage, 240000);
+  setInterval(pollOnwatch, 30000);
+}
+// Always keep a DIRECT `claude -p /usage` reading too — it's the fallback when
+// onWatch's claude quota goes stale (expired window not yet re-logged).
+setTimeout(pollClaudeUsage, 3000);
+setInterval(pollClaudeUsage, 120000);
+
+// Session auto-rotation: a continuous claude thread replays its whole history
+// every --resume turn, so a long-lived session's input balloons (the single
+// biggest token sink). When a turn's replayed context crosses the threshold,
+// summarize the thread once (cheap Haiku) and start a FRESH claude session
+// seeded with that summary — capping replay instead of letting it grow forever.
+function maybeRotateSession(agent, entry) {
+  const limit = Number(reg.sessionRotateCtx != null ? reg.sessionRotateCtx : 40000);
+  if (!limit || !entry || !entry.sid || entry.rotating) return;
+  if (!entry.usage || (entry.usage.ctx || 0) <= limit) return;
+  if (!entry.log || entry.log.length < 4) return;
+  entry.rotating = true;
+  const a = reg.agents[agent] || { name: agent };
+  const convo = entry.log.slice(-50)
+    .map((m) => `${m.who === "you" ? "User" : (m.who === "agent" ? a.name : m.who)}: ` +
+      String(m.text).replace(/\s+/g, " ").slice(0, 600)).join("\n");
+  claudeText(
+    `Summarize this ongoing work thread into a COMPACT brief so the assistant can ` +
+    `continue WITHOUT the full history. Keep every load-bearing fact: decisions, ` +
+    `current state, file paths / names / IDs, and open TODOs. Dense, no filler. ` +
+    `Reply in the thread's own language.\n\n=== THREAD ===\n${convo}`,
+    "claude-haiku-4-5"
+  ).then((summary) => {
+    entry.rotating = false;
+    if (!summary || summary.length < 20) return;
+    entry.rotateSummary = summary;
+    entry.sid = null;     // next turn → fresh claude session, no history replay
+    entry.usage = null;   // reset the ctx gauge baseline
+    saveSess();
+    broadcast({ type: "session.rotated", agent, session: entry.key }, false);
+    console.log(`[rotate] ${agent}/${entry.key}: ctx>${limit} → summarized (${summary.length}c), fresh next turn`);
+  }).catch(() => { entry.rotating = false; });
 }
 
 function runClaude(agent, prompt, opts = {}) {
@@ -1223,7 +1337,9 @@ function runClaude(agent, prompt, opts = {}) {
   // Persona + assigned skills ride in a stdin preamble (robust across
   // Windows shell quoting); resumed sessions already carry it in context.
   const a = reg.agents[agent];
-  const isFresh = isNew;
+  // No claude sid to resume (brand-new thread, rotated, or the session file
+  // vanished) → treat as fresh so the persona/skills preamble is re-sent.
+  const isFresh = isNew || !entry.sid;
   const picked = a && a.tools && a.tools.length ? a.tools : ["Read", "Glob", "Grep"];
   // "mcp:<name>" entries become a real --mcp-config + server-level allow rule.
   const mcpNames = picked.filter((t) => t.startsWith("mcp:"))
@@ -1290,7 +1406,26 @@ SPEAK: <ประโยคพูดสั้นๆ 1 ประโยค เป�
 ทำได้บ่อยพอประมาณให้ออฟฟิศมีชีวิต แต่ "พูดสั้นเสมอ" — อย่าอ่านทั้งข้อความ.
 ข้อยกเว้นเดียว: ถ้าเจ้าของสั่งให้อ่าน/รายงานด้วยเสียงแบบเต็มๆ ค่อยใส่เนื้อหายาวใน SPEAK ได้.
 </voice-capability>` : "";
-  child.stdin.write(preamble + prompt + (canSplit ? SUB_NOTE : "") + VOICE_NOTE + projectNote());
+  // Static instruction blocks (split/voice capability) + the office-projects
+  // list are already in a resumed session's history — re-appending them every
+  // turn just re-bills identical input tokens. Send them on a FRESH session;
+  // re-send the project list only when it actually changed since this session
+  // last saw it (so a newly-registered project still reaches a long thread).
+  const subNote = isFresh && canSplit ? SUB_NOTE : "";
+  const voiceNote = isFresh ? VOICE_NOTE : "";
+  const pn = projectNote();
+  const pnSig = crypto.createHash("sha1").update(pn).digest("hex");
+  const projNote = isFresh || entry.pnSig !== pnSig ? pn : "";
+  entry.pnSig = pnSig;
+  // A rotated thread carries its prior context as a compact summary (seeded
+  // once, in place of replaying the whole history).
+  let rotateNote = "";
+  if (entry.rotateSummary) {
+    rotateNote = `<continuing-context>\n${entry.rotateSummary}\n</continuing-context>\n\n`;
+    entry.rotateSummary = null;
+    saveSess();
+  }
+  child.stdin.write(preamble + rotateNote + prompt + subNote + voiceNote + projNote);
   child.stdin.end();
 
   let buf = "";
@@ -1402,6 +1537,9 @@ SPEAK: <ประโยคพูดสั้นๆ 1 ประโยค เป�
             limit: info.limit, cost: Number(m.total_cost_usd) || 0, est: false });
           trackProviderUse(providerOf(agent), ctx + outTok, Number(m.total_cost_usd) || 0);
           broadcastOverview();
+          // Heavy thread? summarize + rotate so the NEXT turn starts lean.
+          maybeRotateSession(agent, entry);
+          setTimeout(() => { if (onwatchRunning()) pollOnwatch(); else pollClaudeUsage(); }, 2000);
         }
         broadcast({ type: m.is_error ? "task.failed" : "task.completed",
           agent, task, session: entry.key });
@@ -1545,6 +1683,7 @@ function runGeneric(agent, prompt, opts = {}, be = backendOf(reg.agents[agent]))
         limit: info.limit, cost: 0, est: true });
       trackProviderUse(providerOf(agent), ctxEst + outEst, 0);
       broadcastOverview();
+      setTimeout(() => { if (onwatchRunning()) pollOnwatch(); else pollClaudeUsage(); }, 2000);
     }
     broadcast({ type: ok ? "task.completed" : "task.failed", agent, task, session: entry.key });
     statBump(ok ? "done" : "failed", null, 0);
@@ -1651,6 +1790,7 @@ function pumpDirector() {
 function makeDelegateFilter(depth, session, onHit) {
   return (text) => {
     const keep = [];
+    const dispatch = [];   // DELEGATE targets in THIS reply → collected into one batch
     for (const ln of String(text).split("\n")) {
       // PROJECT: <name> @ <place ชื่อย่อ | full path> — the Director creates
       // and registers a project HIMSELF, daemon-side, before any DELEGATE in
@@ -1681,14 +1821,25 @@ function makeDelegateFilter(depth, session, onHit) {
           : Object.keys(reg.agents).find((id) =>
               (reg.agents[id].name || "").toLowerCase() === key.toLowerCase());
       }
-      if (tgt && tgt !== "ceo" && tgt !== "main") {
+      if (tgt && tgt !== "ceo" && tgt !== "main")
+        dispatch.push({ tgt, inst: m[3], projName: m[2] });
+      else keep.push(ln);
+    }
+    // Dispatch every assignment in THIS reply as one batch: each member runs,
+    // results are collected, and the Director is resumed ONCE to synthesize
+    // them (instead of a fresh opus turn per individual report on a thread that
+    // keeps growing). Dispatch happens after the loop so a PROJECT: line earlier
+    // in the same reply has already taken effect.
+    if (dispatch.length) {
+      const batch = { expected: dispatch.length, results: [], session, depth, fired: false };
+      // Safety net: if a member never reports back, synthesize with what we have.
+      batch.timer = setTimeout(() => {
+        if (batch.fired || !batch.results.length) return;
+        batch.fired = true; synthesizeReports(batch);
+      }, 6 * 60000);
+      dispatch.forEach(({ tgt, inst, projName }, i) => {
         broadcast({ type: "task.delegated", agent: "main", target: tgt });
         if (onHit) onHit();
-        const inst = m[3];
-        const t = tgt;
-        const projName = m[2];
-        // Dispatch AFTER the hand-over walk — and resolve the project then,
-        // so a PROJECT: line earlier in this very reply has taken effect.
         setTimeout(() => {
           // Project routing: explicit `@ project` wins; otherwise inherit the
           // Director's own workspace. A target whose latest thread lives
@@ -1698,48 +1849,65 @@ function makeDelegateFilter(depth, session, onHit) {
             : (ml.length ? ml.reduce((a, b) => (a.ts > b.ts ? a : b)) : null);
           const proj = (projName && projectByName(projName)) || (me && me.proj) ||
             projectFromPrompt(inst);
-          // LOCK (reverse): if the owner has this project's window open, an
-          // agent must NOT enter it — report back so the Director re-plans
-          // (and the two never collide inside one working tree).
+          // LOCK (reverse): owner has this project's window open → the agent must
+          // NOT enter it; record a "blocked" result so the batch still completes.
           if (proj && projWin[proj]) {
-            reportToMain(t, `โปรเจค "${projName || proj}" เจ้าของกำลังเปิดทำงานอยู่ — ` +
-              `เข้าไปทำตอนนี้ไม่ได้ รอจนเจ้าของปิดหน้าต่างก่อน`, false, depth, session);
+            collectReport(batch, tgt, `โปรเจค "${projName || proj}" เจ้าของกำลังเปิดทำงานอยู่ — ` +
+              `เข้าไปทำตอนนี้ไม่ได้ รอจนเจ้าของปิดหน้าต่างก่อน`, false);
             return;
           }
-          const tl = sess[t] || [];
+          const tl = sess[tgt] || [];
           const te = tl.length ? tl.reduce((a, b) => (a.ts > b.ts ? a : b)) : null;
-          runAgent(t, inst, {
+          runAgent(tgt, inst, {
             project: proj,
             session: proj && (!te || te.proj !== proj) ? "new" : undefined,
-            onDone: (out, ok) => reportToMain(t, out, ok, depth, session),
+            onDone: (out, ok) => collectReport(batch, tgt, out, ok),
           });
-        }, 4500);
-      } else keep.push(ln);
+        }, 4500 + i * 600);   // light stagger; kinder to CPU/quota than a burst
+      });
     }
     return keep.join("\n").trim();
   };
 }
 
-function reportToMain(fromId, text, ok, depth, session) {
-  const a = reg.agents[fromId] || { name: fromId };
+// Collect one delegate's result into its batch; when the whole batch is in
+// (or the safety timer fires), resume the Director ONCE to synthesize.
+function collectReport(batch, fromId, text, ok) {
+  if (batch.fired) return;
+  batch.results.push({ fromId, text, ok });
+  if (batch.results.length >= batch.expected) {
+    batch.fired = true; clearTimeout(batch.timer);
+    synthesizeReports(batch);
+  }
+}
+
+// ONE Director turn over ALL collected delegate results — the single resume
+// that produces the CEO summary (or follow-up DELEGATE lines). Seeing every
+// result at once also fixes the old bug where the Director closed the order
+// after just the first member reported.
+function synthesizeReports(batch) {
+  const { session, depth } = batch;
+  const body = batch.results.map((r) => {
+    const a = reg.agents[r.fromId] || { name: r.fromId };
+    return `--- ${a.name} (${r.fromId})${r.ok ? "" : " — FAILED"}:\n` +
+      `${String(r.text || "(no result)").slice(0, 4000)}`;
+  }).join("\n\n");
   const wrapped =
-    `Report back from your team member ${a.name} (${fromId})` +
-    (ok ? "" : " — THE TASK FAILED") + `:\n` +
-    `"""${String(text || "(no result)").slice(0, 6000)}"""\n\n` +
+    `All ${batch.results.length} delegated team member(s) have reported back:\n\n${body}\n\n` +
     (depth < 2
-      ? `If they asked you a question or something is missing, answer / follow ` +
-        `up with a line: DELEGATE: ${fromId} :: <your answer or next instruction> ` +
-        `(exact format — it resumes their session with full context). ` +
-        `If the work is complete, write the final summary for the owner (CEO): ` +
-        `clear, concrete, in the language of the original order.`
-      : `Write the final summary for the owner (CEO) now — clear, concrete, in ` +
-        `the language of the original order. Do not delegate further.`);
+      ? `If a member asked a question or something is missing, follow up with one or ` +
+        `more lines: DELEGATE: <agent_id> :: <your answer or next instruction> ` +
+        `(exact format). Otherwise write the FINAL summary for the owner (CEO) — ` +
+        `combine EVERY member's result, clear and concrete, in the language of the ` +
+        `original order.`
+      : `Write the FINAL summary for the owner (CEO) now — combine EVERY member's ` +
+        `result. Do not delegate further.`);
   queueDirectorTurn((release) => {
     let delegatedMore = false;
     runClaude("main", wrapped, {
       session,
       noSub: true,
-      logPrompt: `📨 รายงานผลจาก ${a.name}`,
+      logPrompt: `📨 รวมผล ${batch.results.length} งาน`,
       filterText: depth < 2
         ? makeDelegateFilter(depth + 1, session, () => { delegatedMore = true; })
         : undefined,
@@ -2425,9 +2593,6 @@ let discussing = false;
 async function runDiscussion(ids, topic, rounds, social) {
   discussing = true;
   const task = "disc" + (Date.now() % 100000);
-  // Every meeting is a persistent GROUP session ("@group" bucket): topic,
-  // participants and the full transcript — readable later from the thread
-  // menu, and written to workspace/meetings/ so agents can grep it too.
   const entry = { key: "g" + Date.now(), sid: null, ts: Date.now(),
     title: String(topic).replace(/\s+/g, " ").slice(0, 60),
     agents: ids.slice(), log: [] };
@@ -2435,43 +2600,61 @@ async function runDiscussion(ids, topic, rounds, social) {
   sess["@group"].push(entry);
   saveSess();
   broadcast({ type: "collab.started", agents: ids, task, text: topic, session: entry.key });
+
+  // Meetings run cheap AND cross-model: each agent speaks through its own
+  // backend at the economy tier (Claude → Haiku, Gemini → Flash, … via
+  // backendText/meetingModel), all sharing this one daemon-held transcript.
+  // The final synthesis is a single neutral cheap Claude call.
+  const synthModel = MEETING_MODEL.claude;
   let transcript = "";
+
   try {
     for (let r = 0; r < rounds; r++) {
       for (const id of ids) {
         const a = reg.agents[id] || { name: id, role: "Staff", prompt: "" };
-        const text = await claudeText(
-          `You are "${a.name}" (${a.role}) in a ${social ? "casual break-room chat" : "team meeting"} at the office.\n` +
-          (a.prompt ? `Your persona: ${a.prompt}\n` : "") +
-          `Meeting topic: ${topic}\n` +
-          (transcript ? `Discussion so far:\n${transcript}\n` : "You open the meeting.\n") +
-          `Give YOUR next contribution as ${a.name}: concrete, build on the others, ` +
-          `max 3 sentences, plain text only, in the same language as the topic.` +
-          (social ? `\nถ้าการคุยตกผลึกเป็นไอเดียโปรเจคที่ทีมอยากสร้างจริง ให้เพิ่มบรรทัดสุดท้าย:\n` +
-            `PROPOSAL: <ชื่อโปรเจค> :: <ทำอะไร สั้นๆ>\n` +
-            `(ใช้เฉพาะเมื่อไอเดียชัดและคุ้มจริง — เจ้าของจะเป็นคนอนุมัติ).\n` +
-            `กติกาสำคัญ: โปรเจคต้องเป็นงานสร้างสรรค์อิสระ หรือถ้าอยากต่อยอดกับตัวโปรแกรม ` +
-            `BagIdea Office ให้เสนอเป็น "plugin" เท่านั้น (ดู docs/guide/plugins.md) — ` +
-            `ห้ามเสนอแก้ไขระบบหลัก (daemon/godot/shell) ตรงๆ เพราะจะทำให้โปรแกรมพัง` : ""));
-        let line = text.split("\n").filter(Boolean).join(" ").slice(0, 500);
-        // PROPOSAL: a project pitch for the owner to approve — protocol, not prose.
+        const text = await backendText(id,
+          `You are "${a.name}" (${a.role}). Topic: ${topic}.\n` +
+          `Discussion so far (shorthand):\n${transcript || "(start)"}\n` +
+          `Continue the discussion as ${a.name}. Use EXTREMELY COMPRESSED AI-TO-AI SHORTHAND (min tokens, max density). ` +
+          `No human filler. Focus on core ideas and logic. Max 15 words.` +
+          (social ? `\nIf a project idea crystallizes, end with: PROPOSAL: <name> :: <brief>` : "")
+        );
+
+        let line = text.split("\n").filter(Boolean).join(" ").trim();
         const pm = text.match(/PROPOSAL:\s*([^:]+?)\s*::\s*(.+)/);
         if (pm) {
           line = line.replace(/PROPOSAL:.*$/, "").trim();
           addProposal(id, ids, pm[1], pm[2]);
         }
         if (line) {
-          transcript += `${a.name}: ${line}\n`;
+          transcript += `${id}: ${line}\n`;
           entry.log.push({ who: id, text: line, ts: Date.now() });
           saveSess();
+          // Broadcast the shorthand bubble — "AI talk" to save screen space and tokens.
           broadcast({ type: "chat.message", agent: id, task, text: line, session: entry.key });
         }
+      }
+    }
+
+    // FINAL SYNTHESIS: Convert the shorthand mess into a human-readable summary.
+    if (transcript) {
+      const summary = await claudeText(
+        `Convert this compressed AI discussion transcript into a concise, professional summary in the language of the topic: "${topic}".\n` +
+        `Transcript:\n${transcript}`,
+        synthModel
+      );
+      if (summary) {
+        const dirId = ids[0]; // The first agent (or main) presents the summary
+        const finalLine = `[สรุปผลการประชุม] ${summary}`;
+        entry.log.push({ who: dirId, text: finalLine, ts: Date.now(), isSummary: true });
+        saveSess();
+        broadcast({ type: "chat.message", agent: dirId, task, text: finalLine, session: entry.key });
       }
     }
   } finally {
     broadcast({ type: "collab.ended", agents: ids, task, session: entry.key });
     discussing = false;
-    // Markdown minutes inside the agents' workspace — searchable by them.
+    // ... meetings/ log export ...
     try {
       const dir = path.join(WORKSPACE, "meetings");
       fs.mkdirSync(dir, { recursive: true });
@@ -2645,7 +2828,11 @@ const server = http.createServer((req, res) => {
         if (ids.length < 2) throw new Error("need at least 2 agents");
         if (!p.topic) throw new Error("no topic");
         if (discussing) { res.writeHead(409); return res.end("discussion in progress"); }
-        runDiscussion(ids, String(p.topic), Math.min(Math.max(Number(p.rounds) || 2, 1), 3));
+        // Clamp rounds: the per-round cap was removed by request, but leave an
+        // upper bound so a stray rounds:1000 can't fan out into thousands of
+        // (system-prompt-heavy) claude calls and torch the token budget.
+        const rounds = Math.min(Math.max(Number(p.rounds) || 2, 1), 20);
+        runDiscussion(ids, String(p.topic), rounds);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
@@ -2883,19 +3070,37 @@ const server = http.createServer((req, res) => {
         const dir = projectDir(id);
         if (!dir) { res.writeHead(404); return res.end("unknown project"); }
         const launch = (psCmd, title) => {
-          // Windows Terminal when present (beautiful Thai fonts; a NEW
-          // window, default-profile fonts), classic conhost as fallback.
-          // --suppressApplicationTitle LOCKS the title: it's how hide/resume
-          // finds exactly OUR window — WT shares one process across every
-          // window, so titles are the only safe handle.
-          const line = HAS_WT
-            ? `/c start "" "${WT_EXE}" -w new new-tab --title "${title}" --suppressApplicationTitle -d "${dir}" powershell -NoLogo -NoExit -ExecutionPolicy Bypass ${psCmd}`
-            : `/c start "${title}" /D "${dir}" conhost.exe powershell -NoLogo -NoExit -ExecutionPolicy Bypass ${psCmd}`;
-          spawn("cmd.exe", [line],
-            { windowsVerbatimArguments: true, windowsHide: true, detached: true });
+          if (process.platform === "win32") {
+            // Windows Terminal when present (beautiful Thai fonts; a NEW
+            // window, default-profile fonts), classic conhost as fallback.
+            // --suppressApplicationTitle LOCKS the title: it's how hide/resume
+            // finds exactly OUR window — WT shares one process across every
+            // window, so titles are the only safe handle.
+            const line = HAS_WT
+              ? `/c start "" "${WT_EXE}" -w new new-tab --title "${title}" --suppressApplicationTitle -d "${dir}" powershell -NoLogo -NoExit -ExecutionPolicy Bypass ${psCmd}`
+              : `/c start "${title}" /D "${dir}" conhost.exe powershell -NoLogo -NoExit -ExecutionPolicy Bypass ${psCmd}`;
+            spawn("cmd.exe", [line],
+              { windowsVerbatimArguments: true, windowsHide: true, detached: true })
+              .on("error", (e) => console.error("[proj] launch", e.message));
+            return;
+          }
+          // macOS: open Terminal.app, cd into the project dir, run the command.
+          // psCmd is the Windows tail `-Command "<cmd> #MARKER"`; pull <cmd> out
+          // (the #MARKER survives as a harmless trailing shell comment).
+          const m = /-Command\s+"([\s\S]*)"\s*$/.exec(psCmd);
+          const cmd = m ? m[1] : "";
+          const macDir = String(dir).replace(/\\/g, "/");
+          const shq = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+          const bash = "cd " + shq(macDir) + (cmd ? " && " + cmd : "");
+          const aq = (s) => '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+          const osa = `tell application "Terminal"\n  do script ${aq(bash)}\n  activate\nend tell`;
+          spawn("osascript", ["-e", osa], { detached: true })
+            .on("error", (e) => console.error("[proj] launch", e.message));
         };
         if (mode === "folder") {
-          spawn("explorer", [dir], { detached: true });
+          spawn(process.platform === "win32" ? "explorer" : "open",
+            [String(dir).replace(/\\/g, "/")], { detached: true })
+            .on("error", (e) => console.error("[proj] folder", e.message));
         } else if (mode === "shell") {
           // Plain shell, no marker — not counted as "project open".
           launch("", path.basename(dir));
@@ -2971,11 +3176,23 @@ const server = http.createServer((req, res) => {
       const q = new URL(req.url, "http://x").searchParams;
       let dir = q.get("dir") || "";
       const drives = [];
-      for (let c = 65; c <= 90; c++) {
-        const d = String.fromCharCode(c) + ":\\";
-        try { if (fs.existsSync(d)) drives.push(d); } catch {}
+      if (process.platform === "win32") {
+        for (let c = 65; c <= 90; c++) {
+          const d = String.fromCharCode(c) + ":\\";
+          try { if (fs.existsSync(d)) drives.push(d); } catch {}
+        }
+        if (!dir) dir = drives.includes("D:\\") ? "D:\\" : drives[0] || "C:\\";
+      } else {
+        // POSIX has no drive letters — offer root, home, and mounted volumes
+        // as quick-jump roots instead.
+        const home = require("os").homedir();
+        drives.push("/", home);
+        try {
+          for (const v of fs.readdirSync("/Volumes").sort())
+            if (!v.startsWith(".")) drives.push("/Volumes/" + v);
+        } catch {}
+        dir = (dir || home).replace(/\\/g, "/");  // tolerate old backslash input
       }
-      if (!dir) dir = drives.includes("D:\\") ? "D:\\" : drives[0] || "C:\\";
       let dirs = [];
       try {
         dirs = fs.readdirSync(dir, { withFileTypes: true })
@@ -2986,7 +3203,7 @@ const server = http.createServer((req, res) => {
       const parent = path.dirname(dir);
       res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
       res.end(JSON.stringify({ path: dir, parent: parent === dir ? null : parent,
-        dirs, drives }));
+        dirs, drives, sep: path.sep }));
     }
 
   } else if (req.method === "POST" && req.url === "/fs/mkdir") {
@@ -3871,13 +4088,21 @@ const server = http.createServer((req, res) => {
   } else if (req.method === "POST" && req.url === "/update") {
     // Human-triggered only (in-app 🔄 button or the CLI).
     if (!req.headers["x-bagidea-ui"]) { res.writeHead(403); return res.end("human UI only"); }
+    if (process.platform !== "win32") {
+      // The in-app updater is the Windows update.ps1 flow; macOS updates run
+      // build-mac.sh manually. Don't spawn a missing cmd.exe (it would crash
+      // the daemon via an unhandled spawn error).
+      res.writeHead(501, { "content-type": "text/plain; charset=utf-8" });
+      return res.end("อัปเดตในแอปยังไม่รองรับบน macOS — รัน ./build-mac.sh เองนะครับ");
+    }
     const ps = path.join(__dirname, "..", "installer", "update.ps1");
     // Launch in a REAL, visible console window via `cmd start` so the user can
     // watch git pull + the rebuild — a silent detached process looked hung. It
     // also outlives this daemon (the updater kills + relaunches the whole suite).
     spawn("cmd.exe", ["/c", "start", "BagIdea Update", "powershell",
       "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps],
-      { detached: true, stdio: "ignore", windowsHide: false }).unref();
+      { detached: true, stdio: "ignore", windowsHide: false })
+      .on("error", (e) => console.error("[update]", e.message)).unref();
     res.writeHead(200); res.end("ok");
 
   } else if (req.url === "/health") {
@@ -4028,6 +4253,10 @@ server.on("upgrade", (req, sock) => {
   sock.write(wsFrame(JSON.stringify({ ...rosterEvt(), ts: Date.now() })));
 });
 
-server.listen(8787, "127.0.0.1", () =>
-  console.log("[oep] http+ws listening :8787")
-);
+if (require.main === module) {
+  server.listen(8787, "127.0.0.1", () =>
+    console.log("[oep] http+ws listening :8787")
+  );
+} else {
+  module.exports = { meetingModel, backendOf, claudeText, backendText, parseResetMs, reg };
+}

@@ -962,6 +962,42 @@ fn main() {
     let autostart_id = autostart_item.id().clone();
     let exit_id = exit_item.id().clone();
 
+    // macOS routes Cmd+C/V/X/A and Undo/Redo through the app's main menu bar:
+    // WKWebView only honours those key equivalents if a menu item carries the
+    // matching standard selector (paste:, copy:, …). The overlay is a frameless
+    // window with no menu, so without this the chat box can't paste. Build a
+    // minimal menu bar (App + Edit) so clipboard shortcuts reach the webview.
+    // Kept alive for the whole run via `_app_menu`. Windows handles this natively.
+    #[cfg(target_os = "macos")]
+    let _app_menu = {
+        use tray_icon::menu::Submenu;
+        let menu = Menu::new();
+        let app_m = Submenu::new("BagIdea Office", true);
+        let _ = app_m.append_items(&[
+            &PredefinedMenuItem::about(None, None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::hide(None),
+            &PredefinedMenuItem::hide_others(None),
+            &PredefinedMenuItem::show_all(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::quit(None),
+        ]);
+        let edit_m = Submenu::new("Edit", true);
+        let _ = edit_m.append_items(&[
+            &PredefinedMenuItem::undo(None),
+            &PredefinedMenuItem::redo(None),
+            &PredefinedMenuItem::separator(),
+            &PredefinedMenuItem::cut(None),
+            &PredefinedMenuItem::copy(None),
+            &PredefinedMenuItem::paste(None),
+            &PredefinedMenuItem::select_all(None),
+        ]);
+        let _ = menu.append(&app_m);
+        let _ = menu.append(&edit_m);
+        menu.init_for_nsapp();
+        menu
+    };
+
     platform::spawn_hotkey_thread(event_loop.create_proxy());
 
     let office_pid = office_child.as_ref().map(|c| c.id()).unwrap_or(0);

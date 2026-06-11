@@ -1121,17 +1121,23 @@ function parseResetMs(label) {
 function pollClaudeUsage() {
   if (pollingClaude) return;
   pollingClaude = true;
-  const { execFile } = require("child_process");
-  execFile("claude", ["-p", "/usage"], { timeout: 30000 }, (err, out) => {
+  // Use spawn+shell:true so `claude` resolves correctly on Windows (it's a
+  // .cmd wrapper there — execFile without shell:true gives ENOENT and the
+  // quota silently stays at 0%).
+  const child = spawn("claude", ["-p", "/usage"], { shell: true, timeout: 30000 });
+  let out = "";
+  child.stdout.on("data", (d) => { out += d; });
+  child.on("close", () => {
     pollingClaude = false;
-    if (err || !out) return;
-    const sess = out.match(/Current session:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
-    const week = out.match(/Current week[^:]*:\s*(\d+)%\s*used\s*·\s*resets\s*([^\n]+)/i);
+    if (!out) return;
+    const sess = out.match(/Current session:\s*(\d+)%\s*used\s*[·\-–]\s*resets\s*([^\n]+)/i);
+    const week = out.match(/Current week[^:]*:\s*(\d+)%\s*used\s*[·\-–]\s*resets\s*([^\n]+)/i);
     if (sess) { claudeUsageState.sessionPct = +sess[1]; claudeUsageState.sessionReset = sess[2].trim(); }
     if (week) { claudeUsageState.weekPct = +week[1]; claudeUsageState.weekReset = week[2].trim(); }
     claudeUsageState.ts = Date.now();
     if (sess || week) broadcastOverview();
   });
+  child.on("error", () => { pollingClaude = false; });
 }
 
 // REAL quota for ALL providers via onWatch (github.com/onllm-dev/onwatch): it

@@ -900,6 +900,8 @@ mod platform {
             if list.is_null() {
                 return false;
             }
+            let x_key = NSString::from_str("X");
+            let y_key = NSString::from_str("Y");
             let w_key = NSString::from_str("Width");
             let h_key = NSString::from_str("Height");
             let count: usize = msg_send![list, count];
@@ -925,13 +927,26 @@ mod platform {
                 if bounds.is_null() {
                     continue;
                 }
+                let xn: *mut AnyObject = msg_send![bounds, objectForKey: &*x_key];
+                let yn: *mut AnyObject = msg_send![bounds, objectForKey: &*y_key];
                 let wn: *mut AnyObject = msg_send![bounds, objectForKey: &*w_key];
                 let hn: *mut AnyObject = msg_send![bounds, objectForKey: &*h_key];
-                if wn.is_null() || hn.is_null() {
+                if xn.is_null() || yn.is_null() || wn.is_null() || hn.is_null() {
                     continue;
                 }
+                let wx: f64 = msg_send![xn, doubleValue];
+                let wy: f64 = msg_send![yn, doubleValue];
                 let ww: f64 = msg_send![wn, doubleValue];
                 let hh: f64 = msg_send![hn, doubleValue];
+                
+                // On macOS, the primary monitor always contains the origin (0,0).
+                // A window on a secondary monitor will have X or Y significantly offset.
+                // We assume the wallpaper is on the primary monitor. We only occlude
+                // if the obscuring window's origin is near the primary origin.
+                if wx.abs() > lw * 0.5 || wy.abs() > lh * 0.5 {
+                    continue;
+                }
+
                 // A maximized window leaves the menu bar (~3%) and possibly the
                 // Dock uncovered, so ≥98% width and ≥88% height counts as covered.
                 if ww >= lw * 0.98 && hh >= lh * 0.88 {

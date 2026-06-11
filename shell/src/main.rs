@@ -640,41 +640,69 @@ mod platform {
 
     pub const AUTOSTART_LABEL: &str = "Start with Windows";
 
-    /// True when the foreground window (nearly) covers its monitor — the
-    /// wallpaper is then invisible and the renderer can crawl.
-    pub fn desktop_occluded(_lw: f64, _lh: f64, _own_pid: u32) -> bool {
+    // Scan state for `occl_cb` — an EnumWindows pass that flips `occluded` true
+    // the moment any normal window covers the primary monitor.
+    struct OcclScan { own_pid: u32, occluded: bool }
+
+    unsafe extern "system" fn occl_cb(h: HWND, lp: windows_sys::Win32::Foundation::LPARAM) -> i32 {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
         };
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
-        unsafe {
-            let fg = GetForegroundWindow();
-            if fg == 0 as HWND {
-                return false;
-            }
-            let mut wr: RECT = std::mem::zeroed();
-            if GetWindowRect(fg, &mut wr) == 0 {
-                return false;
-            }
-            let mon = MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY);
-            let mut mi: MONITORINFO = std::mem::zeroed();
-            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(mon, &mut mi) == 0 {
-                return false;
-            }
-            // BagIdea Office wallpaper usually resides on the primary monitor.
-            // If the user is full-screening an app on a secondary monitor, we
-            // shouldn't drop the wallpaper FPS to 2 because it's still visible.
-            if mi.dwFlags & 1 == 0 { // 1 = MONITORINFOF_PRIMARY
-                return false;
-            }
-            let mw = (mi.rcMonitor.right - mi.rcMonitor.left) as f64;
-            let mh = (mi.rcMonitor.bottom - mi.rcMonitor.top) as f64;
-            let ww = (wr.right - wr.left) as f64;
-            let hh = (wr.bottom - wr.top) as f64;
-            ww >= mw * 0.98 && hh >= mh * 0.88
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowRect, IsIconic};
+        let scan = &mut *(lp as *mut OcclScan);
+        // Skip hidden, minimized, and our own (the wallpaper) windows.
+        if IsWindowVisible(h) == 0 || IsIconic(h) != 0 {
+            return 1;
         }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        if pid == scan.own_pid {
+            return 1;
+        }
+        // Skip the desktop shell itself (Progman / WorkerW / SHELLDLL_DefView) —
+        // those ARE full-screen and would always read as "covered".
+        let mut cls = [0u16; 32];
+        let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
+        let name = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+        if name == "Progman" || name == "WorkerW" || name == "SHELLDLL_DefView" {
+            return 1;
+        }
+        // Only windows on the PRIMARY monitor (where the wallpaper lives) count;
+        // a full-screen app on a second monitor leaves the wallpaper visible.
+        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONULL);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(mon, &mut mi) == 0 {
+            return 1;
+        }
+        if mi.dwFlags & 1 == 0 { // 1 = MONITORINFOF_PRIMARY
+            return 1;
+        }
+        let mut wr: RECT = std::mem::zeroed();
+        if GetWindowRect(h, &mut wr) == 0 {
+            return 1;
+        }
+        let mw = (mi.rcMonitor.right - mi.rcMonitor.left) as f64;
+        let mh = (mi.rcMonitor.bottom - mi.rcMonitor.top) as f64;
+        let ww = (wr.right - wr.left) as f64;
+        let hh = (wr.bottom - wr.top) as f64;
+        // Maximized leaves the taskbar (~4%) uncovered: ≥98% width, ≥88% height.
+        if ww >= mw * 0.98 && hh >= mh * 0.88 {
+            scan.occluded = true;
+            return 0; // found a coverer — stop enumerating
+        }
+        1
+    }
+
+    /// True when ANY normal window — not just the focused one — covers the
+    /// primary monitor. Mirrors the macOS CGWindowList scan, so a maximized
+    /// window that lost focus to a small floating window still throttles the
+    /// wallpaper (the foreground-only check used to miss that, wasting CPU).
+    pub fn desktop_occluded(_lw: f64, _lh: f64, own_pid: u32) -> bool {
+        let mut scan = OcclScan { own_pid, occluded: false };
+        unsafe { EnumWindows(Some(occl_cb), &mut scan as *mut OcclScan as _); }
+        scan.occluded
     }
 }
 

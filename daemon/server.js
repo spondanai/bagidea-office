@@ -1140,12 +1140,50 @@ function pollClaudeUsage() {
 // don't expose headlessly. We read its local SQLite DB (no API auth needed).
 const ONWATCH_DB = path.join(require("os").homedir(), ".onwatch", "data", "onwatch.db");
 let onwatchState = {};   // provider -> { pct, resetMs, model?, ts }
+// Prefer Node's built-in node:sqlite (cross-platform, no external binary) and
+// fall back to the `sqlite3` CLI only where the built-in is unavailable. The
+// CLI fallback is why onWatch quota silently never showed on Windows: macOS and
+// most Linux ship `sqlite3`, but Windows doesn't, so the spawn ENOENT'd and the
+// error was swallowed. node:sqlite removes that dependency entirely.
+let _sqliteMod;  // undefined = untried · false = unavailable · object = node:sqlite
+function nodeSqlite() {
+  if (_sqliteMod !== undefined) return _sqliteMod;
+  // Hush the one-time "SQLite is an experimental feature" notice (Node 22-24)
+  // so it doesn't spam the daemon log; let every other warning through.
+  const origWarn = process.emitWarning;
+  process.emitWarning = (w, ...a) => {
+    const s = typeof w === "string" ? w : (w && w.message) || "";
+    if (/SQLite is an experimental/i.test(s)) return;
+    return origWarn.call(process, w, ...a);
+  };
+  try { _sqliteMod = require("node:sqlite"); }
+  catch { _sqliteMod = false; }
+  finally { process.emitWarning = origWarn; }
+  if (_sqliteMod) console.log("[onwatch] reading quota DB via node:sqlite");
+  return _sqliteMod;
+}
 function sqliteJson(query, cb) {
   if (!fs.existsSync(ONWATCH_DB)) return cb(null);
+  const mod = nodeSqlite();
+  if (mod) {
+    let db;
+    try {
+      db = new mod.DatabaseSync(ONWATCH_DB, { readOnly: true });
+      return cb(db.prepare(query).all());
+    } catch (e) {
+      console.error("[onwatch] node:sqlite read failed:", e.message);
+      return cb(null);
+    } finally {
+      try { db && db.close(); } catch {}
+    }
+  }
+  // Fallback: the sqlite3 CLI (absent on Windows by default — quota stays on
+  // estimates there until node:sqlite is available).
   require("child_process").execFile("sqlite3", ["-json", ONWATCH_DB, query],
     { timeout: 5000 }, (err, out) => {
-      if (err || !out) return cb(null);
-      try { cb(JSON.parse(out)); } catch { cb(null); }
+      if (err) { console.error("[onwatch] sqlite3 CLI failed:", err.code || err.message); return cb(null); }
+      if (!out) return cb(null);
+      try { cb(JSON.parse(out)); } catch (e) { console.error("[onwatch] sqlite3 JSON parse failed:", e.message); cb(null); }
     });
 }
 function geminiOfficeModels() {

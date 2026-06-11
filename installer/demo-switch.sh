@@ -5,7 +5,7 @@
 # (clean checkout + rebuild via the canonical installer), and relaunches - so
 # testers can try a feature branch BEFORE it's merged to the public `main`.
 #
-# One-liner:
+# One-liner (defaults to the macOS-updates demo on the spondanai fork):
 #   curl -fsSL https://raw.githubusercontent.com/spondanai/bagidea-office/main/installer/demo-switch.sh | bash
 #
 # Point it at any fork/branch by overriding env vars:

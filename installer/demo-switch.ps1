@@ -74,18 +74,19 @@ $onwatchBin = Get-Command onwatch -ErrorAction SilentlyContinue | Select-Object 
 if (-not $onwatchBin -and (Test-Path $onwatchExe)) { $onwatchBin = $onwatchExe }
 
 if (-not $onwatchBin) {
-  # Download the binary directly — no sub-installer, no hanging pipe.
+  # Download with curl.exe (built-in Windows 10/11) — handles GitHub redirects
+  # reliably without the progress-bar hang that Invoke-WebRequest causes.
   New-Item -ItemType Directory -Force -Path $onwatchDir | Out-Null
-  $ProgressPreference = "SilentlyContinue"
+  $url = "https://github.com/onllm-dev/onwatch/releases/latest/download/onwatch-windows-amd64.exe"
   try {
-    Invoke-WebRequest -Uri "https://github.com/onllm-dev/onwatch/releases/latest/download/onwatch-windows-amd64.exe" `
-                      -OutFile $onwatchExe -UseBasicParsing
-    $onwatchBin = $onwatchExe
-    Ok "downloaded -> $onwatchExe"
+    curl.exe -fsSL -o $onwatchExe $url
+    if (Test-Path $onwatchExe) {
+      $onwatchBin = $onwatchExe
+      Ok "downloaded -> $onwatchExe"
+    } else { throw "file missing after download" }
   } catch {
     Warn "could not download onWatch ($_) — token budget will fall back to claude CLI"
   }
-  $ProgressPreference = "Continue"
 } else {
   Ok "already installed -> $onwatchBin"
 }

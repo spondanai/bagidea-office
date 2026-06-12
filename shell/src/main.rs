@@ -642,14 +642,15 @@ mod platform {
 
     // Scan state for `occl_cb` — an EnumWindows pass that flips `occluded` true
     // the moment any normal window covers the primary monitor.
-    struct OcclScan { own_pid: u32, occluded: bool }
+    struct OcclScan {
+        own_pid: u32,
+        occluded: bool,
+        primary: windows_sys::Win32::Foundation::RECT, // screen coords of primary monitor
+    }
 
     unsafe extern "system" fn occl_cb(h: HWND, lp: windows_sys::Win32::Foundation::LPARAM) -> i32 {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-        use windows_sys::Win32::Graphics::Gdi::{
-            GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL,
-        };
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowRect, IsIconic};
         let scan = &mut *(lp as *mut OcclScan);
         // Skip hidden, minimized, and our own (the wallpaper) windows.
@@ -661,8 +662,7 @@ mod platform {
         if pid == scan.own_pid {
             return 1;
         }
-        // Skip the desktop shell and common full-screen system overlays that
-        // aren't real app windows and would always read as "covered".
+        // Skip the desktop shell and common system overlays.
         let mut cls = [0u16; 64];
         let n = GetClassNameW(h, cls.as_mut_ptr(), cls.len() as i32);
         let name = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
@@ -675,38 +675,35 @@ mod platform {
         ) {
             return 1;
         }
-        // Only windows on the PRIMARY monitor (where the wallpaper lives) count;
-        // a full-screen app on a second monitor leaves the wallpaper visible.
-        let mon = MonitorFromWindow(h, MONITOR_DEFAULTTONULL);
-        let mut mi: MONITORINFO = std::mem::zeroed();
-        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(mon, &mut mi) == 0 {
-            return 1;
-        }
-        if mi.dwFlags & 1 == 0 { // 1 = MONITORINFOF_PRIMARY
-            return 1;
-        }
-        // Prefer DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS) — it returns
-        // the VISIBLE window bounds, excluding the invisible DWM drop-shadow that
-        // GetWindowRect includes (~8px per side on Windows 11). Without this, any
-        // normal window near the screen edge passes the coverage threshold and the
-        // wallpaper stays permanently throttled at 2 fps.
+        // Get the window's visible rect (DWM extended bounds exclude the invisible
+        // drop-shadow; fall back to GetWindowRect for non-DWM windows).
         let mut wr: RECT = std::mem::zeroed();
         let dwm_ok = DwmGetWindowAttribute(
             h,
             DWMWA_EXTENDED_FRAME_BOUNDS,
             &mut wr as *mut RECT as *mut _,
             std::mem::size_of::<RECT>() as u32,
-        ) == 0; // S_OK == 0
+        ) == 0;
         if !dwm_ok {
             if GetWindowRect(h, &mut wr) == 0 { return 1; }
         }
-        let mw = (mi.rcMonitor.right - mi.rcMonitor.left) as f64;
-        let mh = (mi.rcMonitor.bottom - mi.rcMonitor.top) as f64;
-        let ww = (wr.right - wr.left) as f64;
-        let hh = (wr.bottom - wr.top) as f64;
-        // True-fullscreen or maximised (leaves ≤12% taskbar gap): ≥98% w, ≥88% h.
-        if ww >= mw * 0.98 && hh >= mh * 0.88 {
+        // Compute the intersection of the window's rect with the primary monitor
+        // area. Checking intersection (not just window size) means a window on a
+        // secondary monitor — even one that is the same pixel dimensions as the
+        // primary — correctly reads as zero overlap and is ignored.
+        let pr = &scan.primary;
+        let ix_l = wr.left.max(pr.left);
+        let ix_r = wr.right.min(pr.right);
+        let iy_t = wr.top.max(pr.top);
+        let iy_b = wr.bottom.min(pr.bottom);
+        if ix_r <= ix_l || iy_b <= iy_t { return 1; } // no overlap with primary
+        let iw = (ix_r - ix_l) as f64;
+        let ih = (iy_b - iy_t) as f64;
+        let mw = (pr.right - pr.left) as f64;
+        let mh = (pr.bottom - pr.top) as f64;
+        // Occluded when the overlapping area fills ≥98% width AND ≥88% height
+        // (the ≤12% height gap allows for the taskbar).
+        if iw >= mw * 0.98 && ih >= mh * 0.88 {
             scan.occluded = true;
             return 0; // found a coverer — stop enumerating
         }
@@ -718,7 +715,18 @@ mod platform {
     /// window that lost focus to a small floating window still throttles the
     /// wallpaper (the foreground-only check used to miss that, wasting CPU).
     pub fn desktop_occluded(_lw: f64, _lh: f64, own_pid: u32) -> bool {
-        let mut scan = OcclScan { own_pid, occluded: false };
+        use windows_sys::Win32::Foundation::{POINT, RECT};
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+        };
+        let primary: RECT = unsafe {
+            let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            GetMonitorInfoW(mon, &mut mi);
+            mi.rcMonitor
+        };
+        let mut scan = OcclScan { own_pid, occluded: false, primary };
         unsafe { EnumWindows(Some(occl_cb), &mut scan as *mut OcclScan as _); }
         scan.occluded
     }
